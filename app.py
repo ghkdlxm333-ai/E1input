@@ -164,7 +164,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
 
-        # 2차 매칭 (FIFO 선입선출 - 분할 건은 분할된 수량/LOT로 행 추가 생성)
+        # 2차 매칭 (FIFO 선입선출)
         if req_qty > 0:
             for _, inv_row in item_inv.iterrows():
                 cur_lot = inv_row['Lot Number']
@@ -175,8 +175,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                     continue
 
                 use_qty = min(req_qty, avail)
-                
-                # LOT 분할 발생 시 SPLIT 플래그
                 msg = f'⚠️ LOT 분할 선입선출 ({cur_lot})'
                 st_flag = 'SPLIT'
 
@@ -235,25 +233,51 @@ if sales_file and onhand_file:
 
     # --- 사이드바 필터 설정 ---
     st.sidebar.header("🔍 조회 조건 필터")
-    
-    customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
-    selected_cust = st.sidebar.radio("🏢 거래처 (Customer) 선택:", options=["📊 전체 모아보기"] + customers)
 
-    # 구분 필터 (매출/샘플/행사/반품 등 다중 선택)
+    # 1. 구분 필터 (중복 선택 가능 - 거래처보다 위로 배치)
     categories = sorted([cat for cat in df_result['구분'].unique() if pd.notna(cat) and str(cat).strip() != ''])
     selected_cats = st.sidebar.multiselect("🏷️ 구분 (중복 선택 가능):", options=categories, default=categories)
 
-    # 데이터 1차 필터링 (거래처)
-    if selected_cust == "📊 전체 모아보기":
-        df_curr = df_result.copy()
-    else:
-        df_curr = df_result[df_result['Customer'] == selected_cust].copy()
+    # 2. 거래처 선택
+    customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
+    selected_cust = st.sidebar.radio("🏢 거래처 (Customer) 선택:", options=["📊 전체 모아보기"] + customers)
 
-    # 데이터 2차 필터링 (구분)
+    # 3. Date 날짜 범위 필터
+    df_result['Date_dt'] = pd.to_datetime(df_result['Date'], errors='coerce')
+    valid_dates = df_result['Date_dt'].dropna()
+
+    if not valid_dates.empty:
+        min_date = valid_dates.min().date()
+        max_date = valid_dates.max().date()
+        selected_date_range = st.sidebar.date_input(
+            "📅 Date (날짜 범위 필터):",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date
+        )
+    else:
+        selected_date_range = None
+
+    # --- 데이터 필터링 적용 ---
+    df_curr = df_result.copy()
+
+    # 구분 필터링
     if selected_cats:
-        df_curr = df_curr[df_curr['구분'].isin(selected_cats)].copy()
+        df_curr = df_curr[df_curr['구분'].isin(selected_cats)]
     else:
         df_curr = df_curr.iloc[0:0]
+
+    # 거래처 필터링
+    if selected_cust != "📊 전체 모아보기":
+        df_curr = df_curr[df_curr['Customer'] == selected_cust]
+
+    # Date 필터링
+    if selected_date_range and len(selected_date_range) == 2:
+        start_d, end_d = selected_date_range
+        df_curr = df_curr[
+            (df_curr['Date_dt'].dt.date >= start_d) & 
+            (df_curr['Date_dt'].dt.date <= end_d)
+        ]
 
     df_curr = df_curr.reset_index(drop=True)
 
@@ -279,13 +303,23 @@ if sales_file and onhand_file:
     )
 
     # ---------------------------------------------------------
-    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (SHORTAGE 자동 제외 & SPLIT 분할 행 반영)
+    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (요약 및 표)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 표")
 
-    # 재고 부족(SHORTAGE) 건 제외 처리
+    # 재고 부족(SHORTAGE) 건 제외
     df_e1_valid = df_curr[df_curr['상태구분'] != 'SHORTAGE'].copy().reset_index(drop=True)
+
+    e1_tot_cnt = len(df_e1_valid)
+    e1_tot_qty = df_e1_valid['수량'].sum() if not df_e1_valid.empty else 0
+    e1_tot_amt = df_e1_valid['Total Amount'].sum() if not df_e1_valid.empty else 0
+
+    # 복붙용 상단 집계 요약 카드
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("📋 E1 복붙 대상 건수", f"{e1_tot_cnt:,} 건")
+    col_m2.metric("📦 E1 복붙 총 수량", f"{e1_tot_qty:,} 개")
+    col_m3.metric("💰 E1 복붙 총 금액", f"{e1_tot_amt:,} 원")
 
     df_e1 = pd.DataFrame()
     if not df_e1_valid.empty:
@@ -306,7 +340,7 @@ if sales_file and onhand_file:
 
     styled_e1_df = df_e1.style.apply(highlight_status, axis=1)
 
-    st.success(f"✅ E1 즉시 복붙용 **총 {len(df_e1):,}개 행** 준비 완료 (재고부족 건 제외 및 LOT 분할 행 자동 반영). 아래 표를 드래그 후 `Ctrl+C` 하세요.")
+    st.success(f"✅ E1 입력 준비 완료. 아래 표를 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
     st.dataframe(
         styled_e1_df,
