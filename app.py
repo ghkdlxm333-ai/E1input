@@ -125,7 +125,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
             'Location': target_location
         }
 
-        # 1차 매칭
+        # 1차 매칭 (요청 LOT 우선 차감)
         key_sales = (e1_item_code, target_location, sales_lot)
         if sales_lot and key_sales in inventory_pool and inventory_pool[key_sales] > 0:
             avail = inventory_pool[key_sales]
@@ -137,14 +137,14 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                 '수량': int(use_qty),
                 'LOT': sales_lot,
                 '상태구분': status_flag,
-                '상태메시지': '정상 매칭' if status_flag == "NORMAL" else '수량 부족으로 LOT 분할'
+                '상태메시지': '정상 매칭' if status_flag == "NORMAL" else f'⚠️ 수량 부족으로 LOT 분할 ({sales_lot})'
             })
             processed_rows.append(row_data)
 
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
 
-        # 2차 매칭
+        # 2차 매칭 (유통기한 순 FIFO 선입선출 차감)
         if req_qty > 0:
             for _, inv_row in item_inv.iterrows():
                 cur_lot = inv_row['Lot Number']
@@ -156,12 +156,20 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
                 use_qty = min(req_qty, avail)
                 
+                # 분할 건 또는 LOT 변경 건 체크
+                if sales_lot != cur_lot and sales_lot != '':
+                    msg = f'⚠️ LOT 변경 ({sales_lot} ➡️ {cur_lot})'
+                    st_flag = 'REPLACED'
+                else:
+                    msg = f'⚠️ LOT 분할 선입선출 ({cur_lot})'
+                    st_flag = 'SPLIT'
+
                 row_data = sales_base.copy()
                 row_data.update({
                     '수량': int(use_qty),
                     'LOT': cur_lot,
-                    '상태구분': 'REPLACED' if sales_lot != cur_lot else 'SPLIT',
-                    '상태메시지': f'LOT 자동 변경 ({sales_lot} ➡️ {cur_lot})'
+                    '상태구분': st_flag,
+                    '상태메시지': msg
                 })
                 processed_rows.append(row_data)
 
@@ -171,7 +179,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                 if req_qty <= 0:
                     break
 
-        # 3차 매칭
+        # 3차 매칭 (재고 부족)
         if req_qty > 0:
             row_data = sales_base.copy()
             row_data.update({
@@ -186,75 +194,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
-# 3. AgGrid 생성 헬퍼 함수
-# ---------------------------------------------------------
-def render_aggrid_pair(df_target, key_prefix):
-    # 1. 세일즈 리포트 확인 그리드
-    st.markdown("#### 1️⃣ 세일즈 리포트 확인")
-    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지']
-    df_sales_disp = df_target[sales_cols].copy()
-
-    gb1 = GridOptionsBuilder.from_dataframe(df_sales_disp)
-    gb1.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
-    gb1.configure_column("수량", filter='agNumberColumnFilter')
-    gb1.configure_column("단가", filter='agNumberColumnFilter')
-    gb1.configure_column("Total Amount", filter='agNumberColumnFilter')
-    gb1.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
-
-    AgGrid(
-        df_sales_disp,
-        gridOptions=gb1.build(),
-        height=280,
-        theme='balham',
-        fit_columns_on_grid_load=False,
-        key=f"{key_prefix}_grid1"
-    )
-
-    # 2. E1 입력창 복붙용 그리드
-    st.markdown("#### 2️⃣ E1 입력창 복붙용 클립보드 (위 테이블과 100% 동일한 데이터)")
-    df_e1 = pd.DataFrame()
-    df_e1['Line Number'] = [''] * len(df_target)
-    df_e1['Item  Number'] = df_target['제품코드']
-    df_e1['Description'] = [''] * len(df_target)
-    df_e1['Quantity Ordered'] = df_target['수량'].astype(int)
-    df_e1['Unit Price'] = df_target['단가']
-    df_e1['Extended Price'] = (df_target['수량'] * df_target['단가']).astype(int)
-    df_e1['Last Status'] = [''] * len(df_target)
-    df_e1['Lot Number'] = df_target['LOT']
-    df_e1['Requested Date'] = [''] * len(df_target)
-    df_e1['Location'] = df_target['Location']
-
-    gb2 = GridOptionsBuilder.from_dataframe(df_e1)
-    gb2.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
-    gb2.configure_column("Quantity Ordered", filter='agNumberColumnFilter')
-    gb2.configure_column("Unit Price", filter='agNumberColumnFilter')
-    gb2.configure_column("Extended Price", filter='agNumberColumnFilter')
-    gb2.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb2.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
-
-    AgGrid(
-        df_e1,
-        gridOptions=gb2.build(),
-        height=280,
-        theme='balham',
-        fit_columns_on_grid_load=False,
-        key=f"{key_prefix}_grid2"
-    )
-
-    # TSV 다운로드 지원
-    tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
-    st.download_button(
-        label=f"📥 [{key_prefix}] E1 복붙용 .tsv 다운로드",
-        data=tsv_data,
-        file_name=f"E1_Upload_{key_prefix}.tsv",
-        mime="text/tab-separated-values",
-        key=f"{key_prefix}_btn"
-    )
-
-
-# ---------------------------------------------------------
-# 4. 메인 데이터 처리 및 탭 구성
+# 3. 메인 화면 구성 및 사이드바
 # ---------------------------------------------------------
 if sales_file and onhand_file:
     df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
@@ -263,28 +203,115 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
-    st.markdown("---")
-    
-    # Customer 별 Unique 목록 생성 (빈 값 제외)
+    # ---------------------------------------------------------
+    # 왼쪽 사이드바: Customer 선택 메뉴
+    # ---------------------------------------------------------
     customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
     
-    # 탭 생성 (전체 + Customer별 탭)
-    tab_names = ["📊 전체 모아보기"] + [f"🏢 {cust}" for cust in customers]
-    tabs = st.tabs(tab_names)
+    st.sidebar.header("🏢 거래처 (Customer) 선택")
+    selected_cust = st.sidebar.radio(
+        "입력할 거래처를 선택하세요:",
+        options=["📊 전체 모아보기"] + customers
+    )
 
-    # 1. 전체 모아보기 탭
-    with tabs[0]:
-        st.info(f"💡 전체 **{len(df_result):,}건** 데이터입니다.")
-        render_aggrid_pair(df_result, key_prefix="전체")
+    # 선택된 데이터 필터링
+    if selected_cust == "📊 전체 모아보기":
+        df_curr = df_result.copy()
+    else:
+        df_curr = df_result[df_result['Customer'] == selected_cust].copy()
 
-    # 2. 거래처별 탭
-    for idx, cust in enumerate(customers):
-        with tabs[idx + 1]:
-            df_cust = df_result[df_result['Customer'] == cust].copy()
-            
-            tot_qty = df_cust['수량'].sum()
-            tot_amt = df_cust['Total Amount'].sum()
-            st.success(f"📌 **{cust}** | 총 **{len(df_cust):,}건** | 수량: `{tot_qty:,}개` | 금액: `{tot_amt:,}원`")
-            
-            # 각 거래처 탭 내에서 두 그리드가 100% 동일한 데이터로 자동 연동됨
-            render_aggrid_pair(df_cust, key_prefix=str(cust))
+    # 요약 정보 표시
+    tot_qty = df_curr['수량'].sum()
+    tot_amt = df_curr['Total Amount'].sum()
+    
+    st.subheader(f"📌 [{selected_cust}] 세일즈 리포트 확인 및 선택")
+    st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
+
+    # ---------------------------------------------------------
+    # 1️⃣ 세일즈 리포트 확인 그리드 (AgGrid)
+    # ---------------------------------------------------------
+    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지']
+    df_sales_disp = df_curr[sales_cols].copy()
+
+    gb = GridOptionsBuilder.from_dataframe(df_sales_disp)
+    gb.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
+    gb.configure_column("수량", filter='agNumberColumnFilter')
+    gb.configure_column("단가", filter='agNumberColumnFilter')
+    gb1 = gb.build()
+
+    # 색상 조건 스타일링 (재고부족: 빨강, LOT변경/분할: 노랑)
+    # AgGrid 행 선택 옵션 활성화
+    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb_options = gb.build()
+
+    # 테이블 렌더링
+    grid_response = AgGrid(
+        df_sales_disp,
+        gridOptions=gb_options,
+        height=320,
+        theme='balham',
+        fit_columns_on_grid_load=False,
+        key=f"grid_{selected_cust}"
+    )
+
+    # 범례 및 색상 가이드
+    col_leg1, col_leg2 = st.columns(2)
+    with col_leg1:
+        st.caption("🟡 **노란색 범례**: LOT 자동 변경 / 선입선출 수량 분할 입력건")
+    with col_leg2:
+        st.caption("🔴 **빨간색 범례**: E1 재고 부족건")
+
+    # ---------------------------------------------------------
+    # 2️⃣ 버튼 클릭 시 복붙용 클립보드 표 생성
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
+    st.caption("위 표에서 왼쪽 체크박스로 입력할 행들을 선택한 후 아래 버튼을 누르면 드래그 가능한 복붙용 표가 나타납니다.")
+
+    selected_rows = grid_response.get("selected_rows", [])
+
+    if st.button("📋 선택한 행으로 E1 복붙용 클립보드 표 생성하기", type="primary", use_container_width=True):
+        if len(selected_rows) == 0:
+            st.warning("⚠️ 위 표에서 E1에 입력할 행을 1개 이상 체크해 주세요.")
+        else:
+            df_selected = pd.DataFrame(selected_rows)
+
+            # E1 복붙용 서식 생성
+            df_e1 = pd.DataFrame()
+            df_e1['Line Number'] = [''] * len(df_selected)
+            df_e1['Item  Number'] = df_selected['제품코드']
+            df_e1['Description'] = [''] * len(df_selected)
+            df_e1['Quantity Ordered'] = df_selected['수량'].astype(int)
+            df_e1['Unit Price'] = df_selected['단가']
+            df_e1['Extended Price'] = (df_selected['수량'] * df_selected['단가']).astype(int)
+            df_e1['Last Status'] = [''] * len(df_selected)
+            df_e1['Lot Number'] = df_selected['LOT']
+            df_e1['Requested Date'] = [''] * len(df_selected)
+            df_e1['Location'] = df_selected['Location']
+
+            # 색상 강조 적용 함수 (상태메시지 기반)
+            def highlight_status(row):
+                msg = str(row.get('상태메시지', ''))
+                if '재고 부족' in msg or '🚨' in msg:
+                    return ['background-color: #ffcccc'] * len(row)  # 빨강
+                elif 'LOT' in msg or '⚠️' in msg:
+                    return ['background-color: #fff2cc'] * len(row)  # 노랑
+                return [''] * len(row)
+
+            st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 복붙용 표로 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
+
+            # 순수 복붙용 표 (Streamlit native dataframe -> 드래그 및 복사 100% 지원)
+            st.dataframe(
+                df_e1,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # TSV 파일 보조 다운로드
+            tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 선택 건 E1 복붙용 파일 다운로드 (.tsv)",
+                data=tsv_data,
+                file_name=f"E1_Upload_{selected_cust}.tsv",
+                mime="text/tab-separated-values"
+            )
