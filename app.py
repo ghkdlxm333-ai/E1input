@@ -130,14 +130,14 @@ if sales_file and onhand_file:
         sales_base = {
             '구분': category,
             'Date': clean_date,
-            'Customer': s_row.get('Customer', ''),
-            'bill to': s_row.get('bill to ', s_row.get('Ship to ', '')),
-            'Ship to': s_row.get('Ship to ', ''),
+            'Customer': str(s_row.get('Customer', '')).strip(),
+            'bill to': str(s_row.get('bill to ', s_row.get('Ship to ', ''))).strip(),
+            'Ship to': str(s_row.get('Ship to ', '')).strip(),
             '제품코드': item_code,
             '제품명': s_row.get('제품명', ''),
             '단가': unit_price,
             'Total Amount': req_qty * unit_price,
-            '매입확인': s_row.get('매입확인', ''),
+            '매입확인': str(s_row.get('매입확인', '')).strip(),
             'Channel': str(s_row.get('Channel', '')).strip(),
             'Location': target_location
         }
@@ -202,33 +202,45 @@ if sales_file and onhand_file:
     df_result = pd.DataFrame(processed_rows)
 
     # ---------------------------------------------------------
-    # 4. 상단 간단 필터 (날짜 & 채널)
+    # 4. 상단 세부 검색 필터 (구분, Date, Customer, 매입확인)
     # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("🔍 검색 필터 (날짜 및 채널)")
+    st.subheader("🔍 세부 검색 필터")
 
-    f_col1, f_col2 = st.columns(2)
+    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
 
     with f_col1:
-        dates = ['전체'] + sorted(list(df_result['Date'].dropna().astype(str).unique()))
-        sel_date = st.selectbox("📅 날짜 선택:", dates)
+        cat_list = ['전체'] + sorted(list(df_result['구분'].dropna().astype(str).unique()))
+        sel_cat = st.selectbox("📌 구분 (매출/반품):", cat_list)
 
     with f_col2:
-        channels = ['전체'] + sorted(list(df_result['Channel'].dropna().astype(str).unique()))
-        sel_channel = st.selectbox("🏢 채널 선택:", channels)
+        date_list = ['전체'] + sorted(list(df_result['Date'].dropna().astype(str).unique()))
+        sel_date = st.selectbox("📅 Date:", date_list)
+
+    with f_col3:
+        cust_list = ['전체'] + sorted(list(df_result['Customer'].dropna().astype(str).unique()))
+        sel_cust = st.selectbox("🏢 Customer:", cust_list)
+
+    with f_col4:
+        confirm_list = ['전체'] + sorted(list(df_result['매입확인'].dropna().astype(str).unique()))
+        sel_confirm = st.selectbox("✅ 매입확인:", confirm_list)
 
     # 필터링 적용
     df_filtered = df_result.copy()
+    if sel_cat != '전체':
+        df_filtered = df_filtered[df_filtered['구분'] == sel_cat]
     if sel_date != '전체':
         df_filtered = df_filtered[df_filtered['Date'] == sel_date]
-    if sel_channel != '전체':
-        df_filtered = df_filtered[df_filtered['Channel'] == sel_channel]
+    if sel_cust != '전체':
+        df_filtered = df_filtered[df_filtered['Customer'] == sel_cust]
+    if sel_confirm != '전체':
+        df_filtered = df_filtered[df_filtered['매입확인'] == sel_confirm]
 
     # ---------------------------------------------------------
-    # 1st GRID: 세일즈 리포트 확인 그리드 (엑셀 스타일 인터랙티브)
+    # 1st GRID: 세일즈 리포트 확인 그리드 (행 선택 및 실시간 합계 계산 기능)
     # ---------------------------------------------------------
-    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (엑셀 형태)")
-    st.caption("💡 각 열의 헤더를 클릭하여 정렬하거나 검색 기능을 활용해 엑셀처럼 자유롭게 필터링할 수 있습니다.")
+    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (매출/반품 전용)")
+    st.caption("💡 왼쪽 체크박스 또는 행을 **클릭/드래그 선택하면 하단에 수량 및 금액 합계가 실시간으로 자동 계산**됩니다.")
 
     sales_report_cols = [
         '구분', 'Date', 'Customer', 'bill to', 'Ship to', 
@@ -237,7 +249,8 @@ if sales_file and onhand_file:
 
     df_sales_disp = df_filtered[sales_report_cols].copy()
 
-    st.dataframe(
+    # 선택 가능한 DataFrame 이벤트 수신
+    event1 = st.dataframe(
         df_sales_disp,
         use_container_width=True,
         column_config={
@@ -246,15 +259,31 @@ if sales_file and onhand_file:
             "Total Amount": st.column_config.NumberColumn("Total Amount", format="%d"),
             "Date": st.column_config.TextColumn("Date")
         },
-        hide_index=True
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="multi-row"
     )
+
+    # 🧮 선택 영역 실시간 요약 계산 바
+    selected_rows1 = event1.selection.get("rows", [])
+    if selected_rows1:
+        df_selected1 = df_sales_disp.iloc[selected_rows1]
+        sum_qty1 = df_selected1['수량'].sum()
+        sum_amt1 = df_selected1['Total Amount'].sum()
+        
+        st.success(f"📊 **선택한 {len(selected_rows1)}개 행 요약정보:**  |  **수량 합계:** `{sum_qty1:,} 개`  |  **Total Amount 합계:** `{int(sum_amt1):,} 원`")
+    else:
+        # 전체 합계 기본 표시
+        tot_qty1 = df_sales_disp['수량'].sum()
+        tot_amt1 = df_sales_disp['Total Amount'].sum()
+        st.info(f"💡 **조회 전체 ({len(df_sales_disp)}개 행) 요약:**  |  **수량 총합:** `{tot_qty1:,} 개`  |  **Total Amount 총합:** `{int(tot_amt1):,} 원`")
 
     # ---------------------------------------------------------
     # 2nd GRID: E1 입력창 복붙용 클립보드 그리드
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 그리드")
-    st.caption("📋 아래 **표 내부의 셀을 선택한 후 `Ctrl+A` ➡️ `Ctrl+C`** 하여 E1 그리드에 바로 붙여넣으세요.")
+    st.caption("📋 아래 **표 내부의 행을 선택 및 드래그한 후 `Ctrl+C`** 하거나 전체 선택 후 E1에 복붙하세요.")
 
     df_e1 = pd.DataFrame()
     df_e1['Line Number'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
@@ -268,7 +297,7 @@ if sales_file and onhand_file:
     df_e1['Requested Date'] = [''] * len(df_filtered)     # 공란 (ERP 자동생성)
     df_e1['Location'] = df_filtered['Location']
 
-    st.dataframe(
+    event2 = st.dataframe(
         df_e1,
         use_container_width=True,
         column_config={
@@ -276,8 +305,18 @@ if sales_file and onhand_file:
             "Unit Price": st.column_config.NumberColumn("Unit Price", format="%.4f"),
             "Extended Price": st.column_config.NumberColumn("Extended Price", format="%d")
         },
-        hide_index=True
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="multi-row"
     )
+
+    # E1 선택 영역 합계 계산 바
+    selected_rows2 = event2.selection.get("rows", [])
+    if selected_rows2:
+        df_selected2 = df_e1.iloc[selected_rows2]
+        e1_qty = df_selected2['Quantity Ordered'].sum()
+        e1_ext = df_selected2['Extended Price'].sum()
+        st.success(f"📊 **E1 선택 {len(selected_rows2)}개 행 요약:**  |  **Ordered Qty 합계:** `{e1_qty:,}`  |  **Extended Price 합계:** `{e1_ext:,}`")
 
     # 📥 엑셀 보조 다운로드 버튼
     tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
