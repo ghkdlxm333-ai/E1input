@@ -272,20 +272,30 @@ if sales_file and onhand_file:
         'Lot Number', 'Location', '상태메시지'
     ]
 
-    # 테이블 조건부 서식 함수 (에러 수정 완료)
-    def highlight_status(row):
-        flag = row['상태구분']
-        if flag == 'SHORTAGE':
-            return ['background-color: #ffcdd2; color: #b71c1c; font-weight: bold;'] * len(display_cols)
-        elif flag in ['SPLIT', 'REPLACED']:
-            return ['background-color: #fff9c4; color: #f57f17; font-weight: bold;'] * len(display_cols)
-        else:
-            return [''] * len(display_cols)
+    # ✅ 완전 해결된 스타일 지정 함수 (axis=None 방식)
+    def apply_grid_styles(df_in):
+        # 스타일용 데이터프레임 초기화
+        styles = pd.DataFrame('', index=df_in.index, columns=display_cols)
+        
+        for idx in df_in.index:
+            flag = df_in.loc[idx, '상태구분']
+            if flag == 'SHORTAGE':
+                bg_style = 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold;' # 빨강
+            elif flag in ['SPLIT', 'REPLACED']:
+                bg_style = 'background-color: #fff9c4; color: #f57f17; font-weight: bold;' # 노랑
+            else:
+                bg_style = ''
+            
+            for col in display_cols:
+                styles.loc[idx, col] = bg_style
+                
+        return styles
 
     st.subheader("📋 세일즈 및 E1 매칭 확인 그리드")
 
+    # 화면 표시용 컬럼만 자르고, 전체 df_filtered 정보를 참조하여 스타일 적용
     st.dataframe(
-        df_filtered.style.apply(highlight_status, subset=display_cols, axis=1),
+        df_filtered[display_cols].style.apply(lambda _: apply_grid_styles(df_filtered), axis=None),
         use_container_width=True
     )
 
