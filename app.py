@@ -47,7 +47,7 @@ if sales_file and onhand_file:
     st.sidebar.metric("입력 필요건수 (Order # 없음)", len(df_sales_valid))
     st.sidebar.metric("완료건수 (자동제외)", len(df_sales) - len(df_sales_valid))
 
-    # B. Inventory On-Hand Report 로드 (인코딩 자동 파악)
+    # B. Inventory On-Hand Report 로드 (인코딩 및 헤더 위치 자동 파악)
     df_onhand_raw = None
     try:
         if onhand_file.name.endswith('.csv'):
@@ -76,10 +76,10 @@ if sales_file and onhand_file:
         st.stop()
 
     if df_onhand_raw is None:
-        st.error("Inventory On-Hand Report 읽기에 실패했습니다.")
+        st.error("Inventory On-Hand Report 읽기에 실패했습니다. 파일 형식을 확인해주세요.")
         st.stop()
 
-    # C. 재고 전처리
+    # C. 재고 데이터 전처리
     df_onhand_raw.columns = df_onhand_raw.columns.astype(str).str.strip()
     df_onhand = df_onhand_raw.copy()
     df_onhand['On-Hand Qty'] = pd.to_numeric(df_onhand['On-Hand Qty'], errors='coerce').fillna(0)
@@ -110,9 +110,9 @@ if sales_file and onhand_file:
         if '반품' in category:
             target_location = 'RET'
         elif '이동' in category or '재고이동' in category:
-            target_location = 'REP2' # 기본 REP2 설정
+            target_location = 'REP2'
         else:
-            target_location = 'PRI' # 기본 매출
+            target_location = 'PRI'
 
         # E1 Item Number 매핑 (K 접두사 대응)
         if not df_onhand[df_onhand['Item Number'] == item_code].empty:
@@ -147,7 +147,6 @@ if sales_file and onhand_file:
                 'Lot Number': sales_lot,
                 'Requested Date': s_row.get('Date', ''),
                 'Location': target_location,
-                # 조회 필터용 속성
                 'Date': s_row.get('Date', ''),
                 'Channel': s_row.get('Channel', ''),
                 'Customer': s_row.get('Customer', ''),
@@ -267,30 +266,30 @@ if sales_file and onhand_file:
         with h3:
             st.info(f"**선택 건수:** `{len(df_filtered)}행`")
 
-    # 테이블 조건부 서식 함수
-    def highlight_status(row):
-        flag = row['상태구분']
-        if flag == 'SHORTAGE':
-            return ['background-color: #ffcdd2; color: #b71c1c; font-weight: bold;'] * len(row) # 빨강 (재고부족)
-        elif flag in ['SPLIT', 'REPLACED']:
-            return ['background-color: #fff9c4; color: #f57f17; font-weight: bold;'] * len(row) # 노랑 (LOT변경/분할)
-        else:
-            return [''] * len(row)
-
-    st.subheader("📋 세일즈 및 E1 매칭 확인 그리드")
-    
     # 노출용 컬럼 정리
     display_cols = [
         'Item  Number', 'Description', 'Quantity Ordered', 'Unit Price', 'Extended Price', 
         'Lot Number', 'Location', '상태메시지'
     ]
-    
+
+    # 테이블 조건부 서식 함수 (에러 수정 완료)
+    def highlight_status(row):
+        flag = row['상태구분']
+        if flag == 'SHORTAGE':
+            return ['background-color: #ffcdd2; color: #b71c1c; font-weight: bold;'] * len(display_cols)
+        elif flag in ['SPLIT', 'REPLACED']:
+            return ['background-color: #fff9c4; color: #f57f17; font-weight: bold;'] * len(display_cols)
+        else:
+            return [''] * len(display_cols)
+
+    st.subheader("📋 세일즈 및 E1 매칭 확인 그리드")
+
     st.dataframe(
-        df_filtered[display_cols].style.apply(highlight_status, axis=1),
+        df_filtered.style.apply(highlight_status, subset=display_cols, axis=1),
         use_container_width=True
     )
 
-    # E1 입력창 순서 10개 컬럼
+    # E1 입력창 순서 10개 컬럼 (e1 입력창.csv 1:1 맞춤)
     e1_grid_cols = [
         'Line Number', 'Item  Number', 'Description', 'Quantity Ordered', 
         'Unit Price', 'Extended Price', 'Last Status', 'Lot Number', 
