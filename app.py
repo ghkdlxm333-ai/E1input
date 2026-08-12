@@ -19,9 +19,9 @@ with col_up2:
     onhand_file = st.file_uploader("2. Inventory On-Hand Report 업로드 (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="onhand")
 
 # ---------------------------------------------------------
-# 2. 캐싱 처리된 데이터 매칭 엔진
+# 2. 캐싱 처리된 데이터 매칭 엔진 (완전 선입선출 로직 적용)
 # ---------------------------------------------------------
-@st.cache_data(show_spinner="데이터 매칭 처리 중...")
+@st.cache_data(show_spinner="E1 재고 선입선출 매칭 처리 중...")
 def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_file_name):
     if sales_file_name.endswith(('.xlsx', '.xls')):
         df_sales = pd.read_excel(sales_file_bytes, sheet_name='일일출고')
@@ -52,15 +52,20 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     df_sales['is_completed'] = df_sales['Order #'].apply(is_order_completed)
     df_sales['category_clean'] = df_sales['구분'].astype(str).str.strip()
     is_not_move = ~df_sales['category_clean'].str.contains('이동|재고이동', na=False)
-    
     df_sales['수량_num'] = df_sales['수량'].apply(clean_num)
     
+    # 1. 미완료 & 유효 수량 건 필터링
     df_sales_valid = df_sales[
         (~df_sales['is_completed']) & 
         (df_sales['수량_num'] > 0) & 
         is_not_move
     ].copy()
 
+    # 날짜 정렬을 위한 파싱 및 세일즈 날짜순 정렬 (날짜 순 선입선출)
+    df_sales_valid['Date_dt'] = pd.to_datetime(df_sales_valid['Date'], errors='coerce')
+    df_sales_valid = df_sales_valid.sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
+
+    # 2. E1 재고 파일 로드
     df_onhand_raw = None
     if onhand_file_name.endswith('.csv'):
         encodings = ['utf-8-sig', 'cp949', 'euc-kr', 'utf-8', 'latin1']
@@ -95,6 +100,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     df_onhand['Location'] = df_onhand['Location'].apply(clean_str)
     df_onhand['Lot Expiration Date'] = pd.to_datetime(df_onhand['Lot Expiration Date'], errors='coerce')
 
+    # E1 재고 풀 생성
     inventory_pool = {}
     for _, row in df_onhand[df_onhand['On-Hand Qty'] > 0].iterrows():
         key = (row['Item Number'], row['Location'], row['Lot Number'])
@@ -102,11 +108,11 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
     processed_rows = []
 
+    # 3. 세일즈 수주건 차례대로 E1 재고 FIFO 매칭
     for idx, s_row in df_sales_valid.iterrows():
         item_code = clean_str(s_row.get('제품코드', ''))
         req_qty = clean_num(s_row.get('수량', 0))
         unit_price = clean_num(s_row.get('단가', 0))
-        sales_lot = clean_str(s_row.get('LOT', ''))
         category = clean_str(s_row.get('구분', ''))
 
         raw_date = s_row.get('Date', '')
@@ -116,6 +122,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
         target_location = 'RET' if '반품' in category else 'PRI'
 
+        # 제품코드 매칭 (K 접두사 대응)
         if not df_onhand[df_onhand['Item Number'] == item_code].empty:
             e1_item_code = item_code
         elif not df_onhand[df_onhand['Item Number'] == 'K' + item_code].empty:
@@ -123,10 +130,11 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
         else:
             e1_item_code = item_code
 
+        # E1 재고를 유통기한(Expiration Date) 오름차순(선입선출)으로 정렬
         item_inv = df_onhand[
             (df_onhand['Item Number'] == e1_item_code) & 
             (df_onhand['Location'] == target_location)
-        ].sort_values(by='Lot Expiration Date')
+        ].sort_values(by='Lot Expiration Date', ascending=True)
 
         sales_base = {
             '구분': category,
@@ -136,71 +144,79 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
             'Ship to': clean_str(s_row.get('Ship to ', '')),
             '제품코드': item_code,
             '제품명': clean_str(s_row.get('제품명', '')),
-            '수량': req_qty,
             '단가': unit_price,
-            'Total Amount': req_qty * unit_price,
             '매입확인': clean_str(s_row.get('매입확인', '')),
             'Channel': clean_str(s_row.get('Channel', '')),
             'Location': target_location
         }
 
-        # 1차 매칭
-        key_sales = (e1_item_code, target_location, sales_lot)
-        if sales_lot and key_sales in inventory_pool and inventory_pool[key_sales] > 0:
-            avail = inventory_pool[key_sales]
-            use_qty = min(req_qty, avail)
-            status_flag = "NORMAL" if use_qty == req_qty else "SPLIT"
+        # 무조건 E1 재고 선입선출(FIFO) 차감 로직
+        matched_lots = []
+        
+        for _, inv_row in item_inv.iterrows():
+            if req_qty <= 0:
+                break
+                
+            cur_lot = inv_row['Lot Number']
+            key_cur = (e1_item_code, target_location, cur_lot)
+            avail = inventory_pool.get(key_cur, 0)
 
+            if avail <= 0:
+                continue
+
+            use_qty = min(req_qty, avail)
+            matched_lots.append((cur_lot, use_qty))
+
+            inventory_pool[key_cur] -= use_qty
+            req_qty -= use_qty
+
+        # 단일 LOT 매칭 성공
+        if req_qty == 0 and len(matched_lots) == 1:
+            lot_num, qty_used = matched_lots[0]
             row_data = sales_base.copy()
             row_data.update({
-                '수량': int(use_qty),
-                'Total Amount': int(use_qty * unit_price),
-                'LOT': sales_lot,
-                '상태구분': status_flag,
-                '상태메시지': '정상 매칭' if status_flag == "NORMAL" else f'⚠️ LOT 분할 ({sales_lot})'
+                '수량': int(qty_used),
+                'Total Amount': int(qty_used * unit_price),
+                'LOT': lot_num,
+                '상태구분': 'NORMAL',
+                '상태메시지': f'E1 선입선출 매칭 ({lot_num})'
             })
             processed_rows.append(row_data)
 
-            inventory_pool[key_sales] -= use_qty
-            req_qty -= use_qty
-
-        # 2차 매칭 (FIFO 선입선출)
-        if req_qty > 0:
-            for _, inv_row in item_inv.iterrows():
-                cur_lot = inv_row['Lot Number']
-                key_cur = (e1_item_code, target_location, cur_lot)
-                avail = inventory_pool.get(key_cur, 0)
-
-                if avail <= 0:
-                    continue
-
-                use_qty = min(req_qty, avail)
-                msg = f'⚠️ LOT 분할 선입선출 ({cur_lot})'
-                st_flag = 'SPLIT'
-
+        # 수량이 부족하여 복수 LOT로 분할 매칭된 경우 (행 분할)
+        elif req_qty == 0 and len(matched_lots) > 1:
+            for lot_num, qty_used in matched_lots:
                 row_data = sales_base.copy()
                 row_data.update({
-                    '수량': int(use_qty),
-                    'Total Amount': int(use_qty * unit_price),
-                    'LOT': cur_lot,
-                    '상태구분': st_flag,
-                    '상태메시지': msg
+                    '수량': int(qty_used),
+                    'Total Amount': int(qty_used * unit_price),
+                    'LOT': lot_num,
+                    '상태구분': 'SPLIT',
+                    '상태메시지': f'⚠️ LOT 분할 선입선출 ({lot_num})'
                 })
                 processed_rows.append(row_data)
 
-                inventory_pool[key_cur] -= use_qty
-                req_qty -= use_qty
-
-                if req_qty <= 0:
-                    break
-
-        # 3차 매칭 (재고 부족)
-        if req_qty > 0:
+        # 전체 재고 부족 건
+        else:
+            # 부분 할당된 재고가 있다면 행 추가
+            if matched_lots:
+                for lot_num, qty_used in matched_lots:
+                    row_data = sales_base.copy()
+                    row_data.update({
+                        '수량': int(qty_used),
+                        'Total Amount': int(qty_used * unit_price),
+                        'LOT': lot_num,
+                        '상태구분': 'SPLIT',
+                        '상태메시지': f'⚠️ LOT 분할 선입선출 ({lot_num})'
+                    })
+                    processed_rows.append(row_data)
+            
+            # 부족한 잔여 수량에 대해 SHORTAGE 행 추가
             row_data = sales_base.copy()
             row_data.update({
                 '수량': int(req_qty),
                 'Total Amount': int(req_qty * unit_price),
-                'LOT': sales_lot if sales_lot else '재고없음',
+                'LOT': '재고부족',
                 '상태구분': 'SHORTAGE',
                 '상태메시지': f'🚨 E1 {target_location} 재고 부족 ({int(req_qty)}개 부족)'
             })
@@ -210,19 +226,19 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
-# 행 색상 강조 스타일 지정 함수
+# 행 색상 강조 스타일 함수 (LOT 분할: 노랑 / 재고부족: 빨강)
 # ---------------------------------------------------------
 def highlight_status(row):
     status = str(row.get('상태구분', ''))
     if status == 'SPLIT':
-        return ['background-color: #FFF3CD; color: #856404; font-weight: bold;'] * len(row) # 노란색 (LOT 분할만 강조)
+        return ['background-color: #FFF3CD; color: #856404; font-weight: bold;'] * len(row)
     elif status == 'SHORTAGE':
-        return ['background-color: #F8D7DA; color: #721C24; font-weight: bold;'] * len(row) # 빨간색 (재고 부족)
+        return ['background-color: #F8D7DA; color: #721C24; font-weight: bold;'] * len(row)
     return [''] * len(row)
 
 
 # ---------------------------------------------------------
-# 3. 메인 화면 구성 및 인터랙션
+# 3. 메인 화면 구성 및 필터링
 # ---------------------------------------------------------
 if sales_file and onhand_file:
     df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
@@ -231,10 +247,10 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
-    # --- 사이드바 필터 설정 ---
+    # --- 사이드바 필터 ---
     st.sidebar.header("🔍 조회 조건 필터")
 
-    # 1. 구분 필터 (중복 선택 가능 - 거래처보다 위로 배치)
+    # 1. 구분 필터
     categories = sorted([cat for cat in df_result['구분'].unique() if pd.notna(cat) and str(cat).strip() != ''])
     selected_cats = st.sidebar.multiselect("🏷️ 구분 (중복 선택 가능):", options=categories, default=categories)
 
@@ -261,17 +277,14 @@ if sales_file and onhand_file:
     # --- 데이터 필터링 적용 ---
     df_curr = df_result.copy()
 
-    # 구분 필터링
     if selected_cats:
         df_curr = df_curr[df_curr['구분'].isin(selected_cats)]
     else:
         df_curr = df_curr.iloc[0:0]
 
-    # 거래처 필터링
     if selected_cust != "📊 전체 모아보기":
         df_curr = df_curr[df_curr['Customer'] == selected_cust]
 
-    # Date 필터링
     if selected_date_range and len(selected_date_range) == 2:
         start_d, end_d = selected_date_range
         df_curr = df_curr[
@@ -303,7 +316,7 @@ if sales_file and onhand_file:
     )
 
     # ---------------------------------------------------------
-    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (요약 및 표)
+    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (한 줄 요약 & 행 분할 반영)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 표")
@@ -315,11 +328,8 @@ if sales_file and onhand_file:
     e1_tot_qty = df_e1_valid['수량'].sum() if not df_e1_valid.empty else 0
     e1_tot_amt = df_e1_valid['Total Amount'].sum() if not df_e1_valid.empty else 0
 
-    # 복붙용 상단 집계 요약 카드
-    col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("📋 E1 복붙 대상 건수", f"{e1_tot_cnt:,} 건")
-    col_m2.metric("📦 E1 복붙 총 수량", f"{e1_tot_qty:,} 개")
-    col_m3.metric("💰 E1 복붙 총 금액", f"{e1_tot_amt:,} 원")
+    # 복붙용 한 줄 슬림 요약 안내문으로 변경
+    st.info(f"📋 **E1 입력 대상:** 총 **{e1_tot_cnt:,}건**  |  **총 수량:** `{e1_tot_qty:,} 개`  |  **총 금액:** `{e1_tot_amt:,} 원`  (※ 재고부족 건 제외됨)")
 
     df_e1 = pd.DataFrame()
     if not df_e1_valid.empty:
@@ -335,12 +345,12 @@ if sales_file and onhand_file:
         df_e1['Location'] = df_e1_valid['Location'].astype(str)
         df_e1['상태구분'] = df_e1_valid['상태구분']
 
-        # 결측치 최종 제거
+        # 결측치 제거
         df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
 
     styled_e1_df = df_e1.style.apply(highlight_status, axis=1)
 
-    st.success(f"✅ E1 입력 준비 완료. 아래 표를 마우스로 드래그 후 `Ctrl+C` 하세요.")
+    st.success("✅ E1 입력 준비 완료. 아래 표를 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
     st.dataframe(
         styled_e1_df,
