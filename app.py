@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from st_aggrid import AgGrid, GridOptionsBuilder
+from st_aggrid import AgGrid, JsCode
 
 st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
 
@@ -156,7 +156,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
                 use_qty = min(req_qty, avail)
                 
-                # 분할 건 또는 LOT 변경 건 체크
                 if sales_lot != cur_lot and sales_lot != '':
                     msg = f'⚠️ LOT 변경 ({sales_lot} ➡️ {cur_lot})'
                     st_flag = 'REPLACED'
@@ -203,9 +202,7 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
-    # ---------------------------------------------------------
-    # 왼쪽 사이드바: Customer 선택 메뉴
-    # ---------------------------------------------------------
+    # 사이드바 거래처 선택
     customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
     
     st.sidebar.header("🏢 거래처 (Customer) 선택")
@@ -214,13 +211,11 @@ if sales_file and onhand_file:
         options=["📊 전체 모아보기"] + customers
     )
 
-    # 선택된 데이터 필터링
     if selected_cust == "📊 전체 모아보기":
         df_curr = df_result.copy()
     else:
         df_curr = df_result[df_result['Customer'] == selected_cust].copy()
 
-    # 요약 정보 표시
     tot_qty = df_curr['수량'].sum()
     tot_amt = df_curr['Total Amount'].sum()
     
@@ -228,41 +223,69 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
 
     # ---------------------------------------------------------
-    # 1️⃣ 세일즈 리포트 확인 그리드 (AgGrid)
+    # 1️⃣ AgGrid 설정 (오류 수정 및 노랑/빨강 배경색 추가)
     # ---------------------------------------------------------
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지']
     df_sales_disp = df_curr[sales_cols].copy()
 
-    gb = GridOptionsBuilder.from_dataframe(df_sales_disp)
-    gb.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
-    gb.configure_column("수량", filter='agNumberColumnFilter')
-    gb.configure_column("단가", filter='agNumberColumnFilter')
-    gb1 = gb.build()
+    # 셀 색상 지정을 위한 JS 스크립트
+    cell_style_js = JsCode("""
+    function(params) {
+        if (params.data.상태메시지.includes('부족') || params.data.상태메시지.includes('🚨')) {
+            return {'backgroundColor': '#ffcccc', 'color': 'black'};
+        }
+        if (params.data.상태메시지.includes('LOT') || params.data.상태메시지.includes('⚠️')) {
+            return {'backgroundColor': '#fff2cc', 'color': 'black'};
+        }
+        return null;
+    }
+    """)
 
-    # 색상 조건 스타일링 (재고부족: 빨강, LOT변경/분할: 노랑)
-    # AgGrid 행 선택 옵션 활성화
-    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb_options = gb.build()
+    # 컬럼 정의 생성
+    column_defs = []
+    for col in df_sales_disp.columns:
+        col_config = {
+            "field": col,
+            "headerName": col,
+            "sortable": True,
+            "filter": "agNumberColumnFilter" if col in ['수량', '단가', 'Total Amount'] else "agTextColumnFilter",
+            "resizable": True,
+            "cellStyle": cell_style_js
+        }
+        if col == df_sales_disp.columns[0]:
+            col_config["checkboxSelection"] = True
+            col_config["headerCheckboxSelection"] = True
+        column_defs.append(col_config)
 
-    # 테이블 렌더링
+    # 딕셔너리로 gridOptions 구성 (Builder 오류 우회)
+    grid_options = {
+        "columnDefs": column_defs,
+        "rowSelection": "multiple",
+        "suppressRowClickSelection": True,
+        "defaultColDef": {
+            "resizable": True,
+            "sortable": True
+        }
+    }
+
     grid_response = AgGrid(
         df_sales_disp,
-        gridOptions=gb_options,
+        gridOptions=grid_options,
         height=320,
         theme='balham',
         fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
         key=f"grid_{selected_cust}"
     )
 
-    # 범례 및 색상 가이드
     col_leg1, col_leg2 = st.columns(2)
     with col_leg1:
-        st.caption("🟡 **노란색 범례**: LOT 자동 변경 / 선입선출 수량 분할 입력건")
+        st.caption("🟡 **노란색**: LOT 자동 변경 / 선입선출 수량 분할 입력건")
     with col_leg2:
-        st.caption("🔴 **빨간색 범례**: E1 재고 부족건")
+        st.caption("🔴 **빨간색**: E1 재고 부족건")
 
     # ---------------------------------------------------------
-    # 2️⃣ 버튼 클릭 시 복붙용 클립보드 표 생성
+    # 2️⃣ 복붙용 클립보드 생성 영역 (100% 드래그 가능)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
@@ -276,7 +299,6 @@ if sales_file and onhand_file:
         else:
             df_selected = pd.DataFrame(selected_rows)
 
-            # E1 복붙용 서식 생성
             df_e1 = pd.DataFrame()
             df_e1['Line Number'] = [''] * len(df_selected)
             df_e1['Item  Number'] = df_selected['제품코드']
@@ -289,25 +311,15 @@ if sales_file and onhand_file:
             df_e1['Requested Date'] = [''] * len(df_selected)
             df_e1['Location'] = df_selected['Location']
 
-            # 색상 강조 적용 함수 (상태메시지 기반)
-            def highlight_status(row):
-                msg = str(row.get('상태메시지', ''))
-                if '재고 부족' in msg or '🚨' in msg:
-                    return ['background-color: #ffcccc'] * len(row)  # 빨강
-                elif 'LOT' in msg or '⚠️' in msg:
-                    return ['background-color: #fff2cc'] * len(row)  # 노랑
-                return [''] * len(row)
+            st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
-            st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 복붙용 표로 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
-
-            # 순수 복붙용 표 (Streamlit native dataframe -> 드래그 및 복사 100% 지원)
+            # Pure Streamlit DataFrame (복사/드래그 100% 가능)
             st.dataframe(
                 df_e1,
                 use_container_width=True,
                 hide_index=True
             )
 
-            # TSV 파일 보조 다운로드
             tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
             st.download_button(
                 label="📥 선택 건 E1 복붙용 파일 다운로드 (.tsv)",
