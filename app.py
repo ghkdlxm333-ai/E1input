@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
 st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
 
@@ -19,20 +20,16 @@ with col_up2:
     onhand_file = st.file_uploader("2. Inventory On-Hand Report 업로드 (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="onhand")
 
 # ---------------------------------------------------------
-# 2. 데이터 처리 및 매칭 로직
+# 2. 캐싱 처리된 데이터 매칭 엔진
 # ---------------------------------------------------------
-if sales_file and onhand_file:
+@st.cache_data(show_spinner="데이터 매칭 처리 중...")
+def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_file_name):
     # A. 세일즈 리포트 로드
-    try:
-        if sales_file.name.endswith(('.xlsx', '.xls')):
-            df_sales = pd.read_excel(sales_file, sheet_name='일일출고')
-        else:
-            df_sales = pd.read_csv(sales_file)
-    except Exception as e:
-        st.error(f"세일즈 리포트를 읽는 중 오류가 발생했습니다: {e}")
-        st.stop()
+    if sales_file_name.endswith(('.xlsx', '.xls')):
+        df_sales = pd.read_excel(sales_file_bytes, sheet_name='일일출고')
+    else:
+        df_sales = pd.read_csv(sales_file_bytes)
 
-    # Order # 6자리 이미 입력 완료된 건 자동 제외 로직
     def is_order_completed(val):
         if pd.isna(val):
             return False
@@ -40,8 +37,6 @@ if sales_file and onhand_file:
         return len(val_str) == 6 and val_str.isdigit()
 
     df_sales['is_completed'] = df_sales['Order #'].apply(is_order_completed)
-    
-    # 미입력건 + 수량>0 + [재고이동 제외, 매출/반품만 포함]
     df_sales['category_clean'] = df_sales['구분'].astype(str).str.strip()
     is_not_move = ~df_sales['category_clean'].str.contains('이동|재고이동', na=False)
     
@@ -53,35 +48,30 @@ if sales_file and onhand_file:
 
     # B. Inventory On-Hand Report 로드
     df_onhand_raw = None
-    try:
-        if onhand_file.name.endswith('.csv'):
-            encodings = ['utf-8-sig', 'cp949', 'euc-kr', 'utf-8', 'latin1']
-            for enc in encodings:
-                try:
-                    onhand_file.seek(0)
-                    temp_df = pd.read_csv(onhand_file, encoding=enc, header=None, nrows=10)
-                    header_row_idx = None
-                    for idx, row in temp_df.iterrows():
-                        row_str = " ".join(row.dropna().astype(str))
-                        if 'Branch' in row_str and 'Item Number' in row_str:
-                            header_row_idx = idx
-                            break
-                    
-                    if header_row_idx is not None:
-                        onhand_file.seek(0)
-                        df_onhand_raw = pd.read_csv(onhand_file, encoding=enc, header=header_row_idx)
+    if onhand_file_name.endswith('.csv'):
+        encodings = ['utf-8-sig', 'cp949', 'euc-kr', 'utf-8', 'latin1']
+        for enc in encodings:
+            try:
+                onhand_file_bytes.seek(0)
+                temp_df = pd.read_csv(onhand_file_bytes, encoding=enc, header=None, nrows=10)
+                header_row_idx = None
+                for idx, row in temp_df.iterrows():
+                    row_str = " ".join(row.dropna().astype(str))
+                    if 'Branch' in row_str and 'Item Number' in row_str:
+                        header_row_idx = idx
                         break
-                except Exception:
-                    continue
-        else:
-            df_onhand_raw = pd.read_excel(onhand_file, header=2)
-    except Exception as e:
-        st.error(f"Inventory On-Hand Report를 읽는 중 오류가 발생했습니다: {e}")
-        st.stop()
+                
+                if header_row_idx is not None:
+                    onhand_file_bytes.seek(0)
+                    df_onhand_raw = pd.read_csv(onhand_file_bytes, encoding=enc, header=header_row_idx)
+                    break
+            except Exception:
+                continue
+    else:
+        df_onhand_raw = pd.read_excel(onhand_file_bytes, header=2)
 
     if df_onhand_raw is None:
-        st.error("Inventory On-Hand Report 읽기에 실패했습니다. 파일 형식을 확인해주세요.")
-        st.stop()
+        return None
 
     # C. 재고 데이터 전처리
     df_onhand_raw.columns = df_onhand_raw.columns.astype(str).str.strip()
@@ -92,9 +82,6 @@ if sales_file and onhand_file:
     df_onhand['Location'] = df_onhand['Location'].astype(str).str.strip()
     df_onhand['Lot Expiration Date'] = pd.to_datetime(df_onhand['Lot Expiration Date'], errors='coerce')
 
-    # ---------------------------------------------------------
-    # 3. 매칭 엔진 (구분별 Location 및 LOT 수량 검증)
-    # ---------------------------------------------------------
     inventory_pool = {}
     for _, row in df_onhand[df_onhand['On-Hand Qty'] > 0].iterrows():
         key = (row['Item Number'], row['Location'], row['Lot Number'])
@@ -109,7 +96,6 @@ if sales_file and onhand_file:
         sales_lot = str(s_row.get('LOT', '')).strip() if pd.notna(s_row.get('LOT')) else ''
         category = str(s_row.get('구분', '')).strip()
 
-        # Date 시간 제거 포맷팅 (YYYY-MM-DD)
         raw_date = s_row.get('Date', '')
         clean_date = pd.to_datetime(raw_date, errors='coerce').strftime('%Y-%m-%d') if pd.notna(raw_date) else str(raw_date).split(' ')[0]
 
@@ -136,13 +122,13 @@ if sales_file and onhand_file:
             '제품코드': item_code,
             '제품명': s_row.get('제품명', ''),
             '단가': unit_price,
-            'Total Amount': req_qty * unit_price,
+            'Total Amount': int(req_qty * unit_price),
             '매입확인': str(s_row.get('매입확인', '')).strip(),
             'Channel': str(s_row.get('Channel', '')).strip(),
             'Location': target_location
         }
 
-        # 1차 시도: 세일즈 LOT 매칭
+        # 1차 매칭
         key_sales = (e1_item_code, target_location, sales_lot)
         if sales_lot and key_sales in inventory_pool and inventory_pool[key_sales] > 0:
             avail = inventory_pool[key_sales]
@@ -161,7 +147,7 @@ if sales_file and onhand_file:
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
 
-        # 2차 시도: FEFO 대체 및 분할
+        # 2차 매칭
         if req_qty > 0:
             for _, inv_row in item_inv.iterrows():
                 cur_lot = inv_row['Lot Number']
@@ -188,7 +174,7 @@ if sales_file and onhand_file:
                 if req_qty <= 0:
                     break
 
-        # 3차: 재고 전량 부족
+        # 3차 매칭 (재고 부족)
         if req_qty > 0:
             row_data = sales_base.copy()
             row_data.update({
@@ -199,130 +185,84 @@ if sales_file and onhand_file:
             })
             processed_rows.append(row_data)
 
-    df_result = pd.DataFrame(processed_rows)
+    return pd.DataFrame(processed_rows)
 
-    # ---------------------------------------------------------
-    # 4. 상단 세부 검색 필터 (구분, Date, Customer, 매입확인)
-    # ---------------------------------------------------------
+
+# ---------------------------------------------------------
+# 3. 데이터 표시 (초고속 AgGrid 전용 그리드 적용)
+# ---------------------------------------------------------
+if sales_file and onhand_file:
+    df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
+
+    if df_result is None or df_result.empty:
+        st.error("처리 가능한 데이터가 없습니다.")
+        st.stop()
+
     st.markdown("---")
-    st.subheader("🔍 세부 검색 필터")
-
-    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
-
-    with f_col1:
-        cat_list = ['전체'] + sorted(list(df_result['구분'].dropna().astype(str).unique()))
-        sel_cat = st.selectbox("📌 구분 (매출/반품):", cat_list)
-
-    with f_col2:
-        date_list = ['전체'] + sorted(list(df_result['Date'].dropna().astype(str).unique()))
-        sel_date = st.selectbox("📅 Date:", date_list)
-
-    with f_col3:
-        cust_list = ['전체'] + sorted(list(df_result['Customer'].dropna().astype(str).unique()))
-        sel_cust = st.selectbox("🏢 Customer:", cust_list)
-
-    with f_col4:
-        confirm_list = ['전체'] + sorted(list(df_result['매입확인'].dropna().astype(str).unique()))
-        sel_confirm = st.selectbox("✅ 매입확인:", confirm_list)
-
-    # 필터링 적용
-    df_filtered = df_result.copy()
-    if sel_cat != '전체':
-        df_filtered = df_filtered[df_filtered['구분'] == sel_cat]
-    if sel_date != '전체':
-        df_filtered = df_filtered[df_filtered['Date'] == sel_date]
-    if sel_cust != '전체':
-        df_filtered = df_filtered[df_filtered['Customer'] == sel_cust]
-    if sel_confirm != '전체':
-        df_filtered = df_filtered[df_filtered['매입확인'] == sel_confirm]
-
-    # ---------------------------------------------------------
-    # 1st GRID: 세일즈 리포트 확인 그리드 (행 선택 및 실시간 합계 계산 기능)
-    # ---------------------------------------------------------
-    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (매출/반품 전용)")
-    st.caption("💡 왼쪽 체크박스 또는 행을 **클릭/드래그 선택하면 하단에 수량 및 금액 합계가 실시간으로 자동 계산**됩니다.")
+    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (초고속 AgGrid)")
+    st.caption("💡 각 열 헤더의 **필터 아이콘**으로 엑셀처럼 필터링하고, **셀/범위를 드래그**하면 우측 하단에 **합계/평균이 자동 계산**됩니다.")
 
     sales_report_cols = [
         '구분', 'Date', 'Customer', 'bill to', 'Ship to', 
         '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지'
     ]
+    df_sales_disp = df_result[sales_report_cols].copy()
 
-    df_sales_disp = df_filtered[sales_report_cols].copy()
+    # 🚀 AgGrid 옵션 설정 (엑셀 기능 활성화)
+    gb1 = GridOptionsBuilder.from_dataframe(df_sales_disp)
+    gb1.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb1.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True) # 범위 선택 및 하단 상태바 활성화
+    
+    gridOptions1 = gb1.build()
 
-    # 선택 가능한 DataFrame 이벤트 수신
-    event1 = st.dataframe(
+    AgGrid(
         df_sales_disp,
-        use_container_width=True,
-        column_config={
-            "수량": st.column_config.NumberColumn("수량", format="%d"),
-            "단가": st.column_config.NumberColumn("단가", format="%.4f"),
-            "Total Amount": st.column_config.NumberColumn("Total Amount", format="%d"),
-            "Date": st.column_config.TextColumn("Date")
-        },
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="multi-row"
+        gridOptions=gridOptions1,
+        height=350,
+        theme='balham', # 엑셀과 비슷한 깔끔한 테마
+        fit_columns_on_grid_load=False
     )
 
-    # 🧮 선택 영역 실시간 요약 계산 바
-    selected_rows1 = event1.selection.get("rows", [])
-    if selected_rows1:
-        df_selected1 = df_sales_disp.iloc[selected_rows1]
-        sum_qty1 = df_selected1['수량'].sum()
-        sum_amt1 = df_selected1['Total Amount'].sum()
-        
-        st.success(f"📊 **선택한 {len(selected_rows1)}개 행 요약정보:**  |  **수량 합계:** `{sum_qty1:,} 개`  |  **Total Amount 합계:** `{int(sum_amt1):,} 원`")
-    else:
-        # 전체 합계 기본 표시
-        tot_qty1 = df_sales_disp['수량'].sum()
-        tot_amt1 = df_sales_disp['Total Amount'].sum()
-        st.info(f"💡 **조회 전체 ({len(df_sales_disp)}개 행) 요약:**  |  **수량 총합:** `{tot_qty1:,} 개`  |  **Total Amount 총합:** `{int(tot_amt1):,} 원`")
-
     # ---------------------------------------------------------
-    # 2nd GRID: E1 입력창 복붙용 클립보드 그리드
+    # 2nd GRID: E1 복붙용 그리드
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 그리드")
-    st.caption("📋 아래 **표 내부의 행을 선택 및 드래그한 후 `Ctrl+C`** 하거나 전체 선택 후 E1에 복붙하세요.")
+    st.caption("📋 원하는 행을 드래그하여 선택 후 `Ctrl+C` 하여 E1에 붙여넣으세요.")
 
     df_e1 = pd.DataFrame()
-    df_e1['Line Number'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
-    df_e1['Item  Number'] = df_filtered['제품코드']
-    df_e1['Description'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
-    df_e1['Quantity Ordered'] = df_filtered['수량'].astype(int)
-    df_e1['Unit Price'] = df_filtered['단가']
-    df_e1['Extended Price'] = (df_filtered['수량'] * df_filtered['단가']).astype(int)
-    df_e1['Last Status'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
-    df_e1['Lot Number'] = df_filtered['LOT']
-    df_e1['Requested Date'] = [''] * len(df_filtered)     # 공란 (ERP 자동생성)
-    df_e1['Location'] = df_filtered['Location']
+    df_e1['Line Number'] = [''] * len(df_result)
+    df_e1['Item  Number'] = df_result['제품코드']
+    df_e1['Description'] = [''] * len(df_result)
+    df_e1['Quantity Ordered'] = df_result['수량'].astype(int)
+    df_e1['Unit Price'] = df_result['단가']
+    df_e1['Extended Price'] = (df_result['수량'] * df_result['단가']).astype(int)
+    df_e1['Last Status'] = [''] * len(df_result)
+    df_e1['Lot Number'] = df_result['LOT']
+    df_e1['Requested Date'] = [''] * len(df_result)
+    df_e1['Location'] = df_result['Location']
 
-    event2 = st.dataframe(
+    gb2 = GridOptionsBuilder.from_dataframe(df_e1)
+    gb2.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb2.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb2.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
+    
+    gridOptions2 = gb2.build()
+
+    AgGrid(
         df_e1,
-        use_container_width=True,
-        column_config={
-            "Quantity Ordered": st.column_config.NumberColumn("Quantity Ordered", format="%d"),
-            "Unit Price": st.column_config.NumberColumn("Unit Price", format="%.4f"),
-            "Extended Price": st.column_config.NumberColumn("Extended Price", format="%d")
-        },
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="multi-row"
+        gridOptions=gridOptions2,
+        height=350,
+        theme='balham',
+        fit_columns_on_grid_load=False
     )
 
-    # E1 선택 영역 합계 계산 바
-    selected_rows2 = event2.selection.get("rows", [])
-    if selected_rows2:
-        df_selected2 = df_e1.iloc[selected_rows2]
-        e1_qty = df_selected2['Quantity Ordered'].sum()
-        e1_ext = df_selected2['Extended Price'].sum()
-        st.success(f"📊 **E1 선택 {len(selected_rows2)}개 행 요약:**  |  **Ordered Qty 합계:** `{e1_qty:,}`  |  **Extended Price 합계:** `{e1_ext:,}`")
-
-    # 📥 엑셀 보조 다운로드 버튼
+    # 📥 TSV 보조 다운로드
     tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
     st.download_button(
         label="📥 E1 복붙용 데이터 파일 다운로드 (.tsv)",
         data=tsv_data,
-        file_name=f"E1_Upload_Data_{sel_date}.tsv",
+        file_name="E1_Upload_Data.tsv",
         mime="text/tab-separated-values"
     )
