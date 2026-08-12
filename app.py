@@ -198,6 +198,9 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
+    # ---------------------------------------------------------
+    # 1st GRID: 세일즈 리포트 확인 그리드
+    # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (초고속 AgGrid)")
     st.caption("💡 각 열 헤더의 **필터 아이콘**으로 엑셀처럼 필터링하고, **셀/범위를 드래그**하면 우측 하단에 **합계/평균이 자동 계산**됩니다.")
@@ -208,11 +211,20 @@ if sales_file and onhand_file:
     ]
     df_sales_disp = df_result[sales_report_cols].copy()
 
-    # 🚀 AgGrid 옵션 설정 (엑셀 기능 활성화)
+    # 🚀 문자열/숫자 전체 필터 활성화 옵션
     gb1 = GridOptionsBuilder.from_dataframe(df_sales_disp)
-    gb1.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb1.configure_default_column(
+        filterable=True, 
+        sortable=True, 
+        resizable=True,
+        filter='agTextColumnFilter'  # 기본 필터를 텍스트 검색 필터로 지정
+    )
+    gb1.configure_column("수량", filter='agNumberColumnFilter')
+    gb1.configure_column("단가", filter='agNumberColumnFilter')
+    gb1.configure_column("Total Amount", filter='agNumberColumnFilter')
+    
     gb1.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True) # 범위 선택 및 하단 상태바 활성화
+    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
     
     gridOptions1 = gb1.build()
 
@@ -220,12 +232,12 @@ if sales_file and onhand_file:
         df_sales_disp,
         gridOptions=gridOptions1,
         height=350,
-        theme='balham', # 엑셀과 비슷한 깔끔한 테마
+        theme='balham',
         fit_columns_on_grid_load=False
     )
 
     # ---------------------------------------------------------
-    # 2nd GRID: E1 복붙용 그리드
+    # 2nd GRID: E1 입력창 복붙용 클립보드 그리드
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 그리드")
@@ -244,7 +256,16 @@ if sales_file and onhand_file:
     df_e1['Location'] = df_result['Location']
 
     gb2 = GridOptionsBuilder.from_dataframe(df_e1)
-    gb2.configure_default_column(filterable=True, sortable=True, resizable=True)
+    gb2.configure_default_column(
+        filterable=True, 
+        sortable=True, 
+        resizable=True,
+        filter='agTextColumnFilter'
+    )
+    gb2.configure_column("Quantity Ordered", filter='agNumberColumnFilter')
+    gb2.configure_column("Unit Price", filter='agNumberColumnFilter')
+    gb2.configure_column("Extended Price", filter='agNumberColumnFilter')
+
     gb2.configure_selection(selection_mode="multiple", use_checkbox=True)
     gb2.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
     
