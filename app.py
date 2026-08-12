@@ -223,14 +223,14 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
 
     # ---------------------------------------------------------
-    # 1️⃣ AgGrid 설정 (KeyError 방지용 Location 추가 및 간격 조절)
+    # 1️⃣ AgGrid 설정 (여유 있는 너비 조절)
     # ---------------------------------------------------------
-    # 🚨 KeyError 방지를 위해 Location 필수 포함
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지']
     df_sales_disp = df_curr[sales_cols].copy()
 
     cell_style_js = JsCode("""
     function(params) {
+        if (!params.data || !params.data.상태메시지) return null;
         if (params.data.상태메시지.includes('부족') || params.data.상태메시지.includes('🚨')) {
             return {'backgroundColor': '#ffcccc', 'color': 'black'};
         }
@@ -241,22 +241,22 @@ if sales_file and onhand_file:
     }
     """)
 
-    # 컬럼별 최적화 권장 너비 지정
+    # 글자가 잘리지 않도록 컬럼 너비를 한층 넓게 지정
     col_widths = {
-        '구분': 80,
-        'Date': 100,
-        'Customer': 110,
-        'bill to': 110,
-        'Ship to': 110,
-        '제품코드': 100,
-        '제품명': 160,
-        '수량': 70,
-        '단가': 80,
-        'Total Amount': 100,
-        '매입확인': 80,
-        'LOT': 100,
-        'Location': 80,
-        '상태메시지': 180
+        '구분': 100,
+        'Date': 110,
+        'Customer': 140,
+        'bill to': 140,
+        'Ship to': 140,
+        '제품코드': 120,
+        '제품명': 220,
+        '수량': 90,
+        '단가': 100,
+        'Total Amount': 120,
+        '매입확인': 100,
+        'LOT': 120,
+        'Location': 100,
+        '상태메시지': 220
     }
 
     column_defs = []
@@ -267,13 +267,13 @@ if sales_file and onhand_file:
             "sortable": True,
             "filter": "agNumberColumnFilter" if col in ['수량', '단가', 'Total Amount'] else "agTextColumnFilter",
             "resizable": True,
-            "width": col_widths.get(col, 100),
+            "width": col_widths.get(col, 130),
             "cellStyle": cell_style_js
         }
         if col == df_sales_disp.columns[0]:
             col_config["checkboxSelection"] = True
             col_config["headerCheckboxSelection"] = True
-            col_config["width"] = 100
+            col_config["width"] = 120
         column_defs.append(col_config)
 
     grid_options = {
@@ -286,13 +286,13 @@ if sales_file and onhand_file:
         }
     }
 
-    # fit_columns_on_grid_load=True 로 설정하여 화면 폭에 맞춰 컬럼 너비 타이트하게 자동 조절
+    # fit_columns_on_grid_load=False로 지정해 타이트하게 찌그러지는 현상 방지
     grid_response = AgGrid(
         df_sales_disp,
         gridOptions=grid_options,
-        height=320,
+        height=350,
         theme='balham',
-        fit_columns_on_grid_load=True,
+        fit_columns_on_grid_load=False,
         allow_unsafe_jscode=True,
         key=f"grid_{selected_cust}"
     )
@@ -304,7 +304,7 @@ if sales_file and onhand_file:
         st.caption("🔴 **빨간색**: E1 재고 부족건")
 
     # ---------------------------------------------------------
-    # 2️⃣ 복붙용 클립보드 생성 영역 (KeyError 완전 해결)
+    # 2️⃣ 복붙용 클립보드 생성 영역 (None 버그 완벽 수정)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
@@ -313,22 +313,29 @@ if sales_file and onhand_file:
     selected_rows = grid_response.get("selected_rows", [])
 
     if st.button("📋 선택한 행으로 E1 복붙용 클립보드 표 생성하기", type="primary", use_container_width=True):
-        if len(selected_rows) == 0:
+        if selected_rows is None or len(selected_rows) == 0:
             st.warning("⚠️ 위 표에서 E1에 입력할 행을 1개 이상 체크해 주세요.")
         else:
-            df_selected = pd.DataFrame(selected_rows)
+            # selected_rows 객체 호환성 처리
+            if isinstance(selected_rows, pd.DataFrame):
+                df_selected = selected_rows
+            else:
+                df_selected = pd.DataFrame(selected_rows)
+
+            def safe_get(df, col):
+                return df[col] if col in df.columns else [''] * len(df)
 
             df_e1 = pd.DataFrame()
             df_e1['Line Number'] = [''] * len(df_selected)
-            df_e1['Item  Number'] = df_selected['제품코드']
+            df_e1['Item  Number'] = safe_get(df_selected, '제품코드')
             df_e1['Description'] = [''] * len(df_selected)
-            df_e1['Quantity Ordered'] = df_selected['수량'].astype(int)
-            df_e1['Unit Price'] = df_selected['단가']
-            df_e1['Extended Price'] = (df_selected['수량'] * df_selected['단가']).astype(int)
+            df_e1['Quantity Ordered'] = pd.to_numeric(safe_get(df_selected, '수량'), errors='coerce').fillna(0).astype(int)
+            df_e1['Unit Price'] = pd.to_numeric(safe_get(df_selected, '단가'), errors='coerce').fillna(0)
+            df_e1['Extended Price'] = df_e1['Quantity Ordered'] * df_e1['Unit Price']
             df_e1['Last Status'] = [''] * len(df_selected)
-            df_e1['Lot Number'] = df_selected['LOT']
+            df_e1['Lot Number'] = safe_get(df_selected, 'LOT')
             df_e1['Requested Date'] = [''] * len(df_selected)
-            df_e1['Location'] = df_selected['Location']
+            df_e1['Location'] = safe_get(df_selected, 'Location')
 
             st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
