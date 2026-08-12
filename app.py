@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
+st.set_page_config(page_title="E1 Order Matrix", layout="wide")
 
-st.title("📦 E1 Auto Grid (E1 오토 그리드)")
-st.caption("세일즈 리포트의 매출/반품 건을 확인하고, Inventory On-Hand Report와 매칭하여 E1에 즉시 복붙 가능한 클립보드를 생성합니다.")
+st.title("📦 E1 Order Matrix (E1 수주 자동 매칭 시스템)")
+st.caption("세일즈 리포트 수주 건을 E1 On-Hand 재고와 FIFO(선입선출)로 자동 매칭하여 E1 입력용 그리드를 생성합니다.")
 
 # ---------------------------------------------------------
 # 1. 파일 업로드 영역
@@ -198,7 +198,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
         # 전체 재고 부족 건
         else:
-            # 부분 할당된 재고가 있다면 행 추가
             if matched_lots:
                 for lot_num, qty_used in matched_lots:
                     row_data = sales_base.copy()
@@ -211,7 +210,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                     })
                     processed_rows.append(row_data)
             
-            # 부족한 잔여 수량에 대해 SHORTAGE 행 추가
             row_data = sales_base.copy()
             row_data.update({
                 '수량': int(req_qty),
@@ -226,7 +224,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
-# 행 색상 강조 스타일 함수 (LOT 분할: 노랑 / 재고부족: 빨강)
+# 행 색상 강조 스타일 함수
 # ---------------------------------------------------------
 def highlight_status(row):
     status = str(row.get('상태구분', ''))
@@ -238,7 +236,7 @@ def highlight_status(row):
 
 
 # ---------------------------------------------------------
-# 3. 메인 화면 구성 및 필터링
+# 3. 메인 화면 구성 및 필터링 (개선된 UI)
 # ---------------------------------------------------------
 if sales_file and onhand_file:
     df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
@@ -247,18 +245,9 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
-    # --- 사이드바 필터 ---
     st.sidebar.header("🔍 조회 조건 필터")
 
-    # 1. 구분 필터
-    categories = sorted([cat for cat in df_result['구분'].unique() if pd.notna(cat) and str(cat).strip() != ''])
-    selected_cats = st.sidebar.multiselect("🏷️ 구분 (중복 선택 가능):", options=categories, default=categories)
-
-    # 2. 거래처 선택
-    customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
-    selected_cust = st.sidebar.radio("🏢 거래처 (Customer) 선택:", options=["📊 전체 모아보기"] + customers)
-
-    # 3. Date 날짜 범위 필터
+    # --- 1. Date 날짜 범위 필터 (맨 상단으로 이동) ---
     df_result['Date_dt'] = pd.to_datetime(df_result['Date'], errors='coerce')
     valid_dates = df_result['Date_dt'].dropna()
 
@@ -266,7 +255,7 @@ if sales_file and onhand_file:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
         selected_date_range = st.sidebar.date_input(
-            "📅 Date (날짜 범위 필터):",
+            "📅 Date (날짜 범위):",
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date
@@ -274,23 +263,41 @@ if sales_file and onhand_file:
     else:
         selected_date_range = None
 
-    # --- 데이터 필터링 적용 ---
-    df_curr = df_result.copy()
-
-    if selected_cats:
-        df_curr = df_curr[df_curr['구분'].isin(selected_cats)]
-    else:
-        df_curr = df_curr.iloc[0:0]
-
-    if selected_cust != "📊 전체 모아보기":
-        df_curr = df_curr[df_curr['Customer'] == selected_cust]
-
+    # 날짜 필터 1차 적용
+    df_filtered_by_date = df_result.copy()
     if selected_date_range and len(selected_date_range) == 2:
         start_d, end_d = selected_date_range
-        df_curr = df_curr[
-            (df_curr['Date_dt'].dt.date >= start_d) & 
-            (df_curr['Date_dt'].dt.date <= end_d)
+        df_filtered_by_date = df_filtered_by_date[
+            (df_filtered_by_date['Date_dt'].dt.date >= start_d) & 
+            (df_filtered_by_date['Date_dt'].dt.date <= end_d)
         ]
+
+    # --- 2. 구분 필터 (단순화된 드롭다운/Selectbox 형태) ---
+    categories = sorted([cat for cat in df_filtered_by_date['구분'].unique() if pd.notna(cat) and str(cat).strip() != ''])
+    category_options = ["전체 선택"] + categories
+    selected_cat_option = st.sidebar.selectbox("🏷️ 구분 선택:", options=category_options, index=0)
+
+    if selected_cat_option == "전체 선택":
+        selected_cats = categories
+    else:
+        selected_cats = [selected_cat_option]
+
+    # 구분 필터 2차 적용
+    df_filtered_by_cat = df_filtered_by_date[df_filtered_by_date['구분'].isin(selected_cats)]
+
+    # --- 3. 연동형 거래처 필터 (선택된 날짜/구분에 해당하는 거래처만 표시) ---
+    available_customers = sorted([c for c in df_filtered_by_cat['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
+    
+    selected_cust = st.sidebar.selectbox(
+        "🏢 거래처 (Customer) 선택:",
+        options=["📊 전체 모아보기"] + available_customers,
+        index=0
+    )
+
+    # 최종 필터링 데이터 확정
+    df_curr = df_filtered_by_cat.copy()
+    if selected_cust != "📊 전체 모아보기":
+        df_curr = df_curr[df_curr['Customer'] == selected_cust]
 
     df_curr = df_curr.reset_index(drop=True)
 
@@ -301,7 +308,7 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`  |  🟡 **노란색:** LOT 분할  |  🔴 **빨간색:** 재고 부족 (복붙 제외됨)")
 
     # ---------------------------------------------------------
-    # 1️⃣ 상단 세일즈 리포트 결과 (상태 점검용)
+    # 1️⃣ 상단 세일즈 리포트 결과
     # ---------------------------------------------------------
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지', '상태구분']
     df_sales_disp = df_curr[sales_cols].copy()
@@ -316,19 +323,17 @@ if sales_file and onhand_file:
     )
 
     # ---------------------------------------------------------
-    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (한 줄 요약 & 행 분할 반영)
+    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 표
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 표")
 
-    # 재고 부족(SHORTAGE) 건 제외
     df_e1_valid = df_curr[df_curr['상태구분'] != 'SHORTAGE'].copy().reset_index(drop=True)
 
     e1_tot_cnt = len(df_e1_valid)
     e1_tot_qty = df_e1_valid['수량'].sum() if not df_e1_valid.empty else 0
     e1_tot_amt = df_e1_valid['Total Amount'].sum() if not df_e1_valid.empty else 0
 
-    # 복붙용 한 줄 슬림 요약 안내문으로 변경
     st.info(f"📋 **E1 입력 대상:** 총 **{e1_tot_cnt:,}건**  |  **총 수량:** `{e1_tot_qty:,} 개`  |  **총 금액:** `{e1_tot_amt:,} 원`  (※ 재고부족 건 제외됨)")
 
     df_e1 = pd.DataFrame()
@@ -345,7 +350,6 @@ if sales_file and onhand_file:
         df_e1['Location'] = df_e1_valid['Location'].astype(str)
         df_e1['상태구분'] = df_e1_valid['상태구분']
 
-        # 결측치 제거
         df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
 
     styled_e1_df = df_e1.style.apply(highlight_status, axis=1)
