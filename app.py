@@ -138,7 +138,7 @@ if sales_file and onhand_file:
             '단가': unit_price,
             'Total Amount': req_qty * unit_price,
             '매입확인': s_row.get('매입확인', ''),
-            'Channel': s_row.get('Channel', ''),
+            'Channel': str(s_row.get('Channel', '')).strip(),
             'Location': target_location
         }
 
@@ -210,11 +210,11 @@ if sales_file and onhand_file:
     f_col1, f_col2 = st.columns(2)
 
     with f_col1:
-        dates = ['전체'] + sorted(list(df_result['Date'].dropna().unique()))
+        dates = ['전체'] + sorted(list(df_result['Date'].dropna().astype(str).unique()))
         sel_date = st.selectbox("📅 날짜 선택:", dates)
 
     with f_col2:
-        channels = ['전체'] + sorted(list(df_result['Channel'].dropna().unique()))
+        channels = ['전체'] + sorted(list(df_result['Channel'].dropna().astype(str).unique()))
         sel_channel = st.selectbox("🏢 채널 선택:", channels)
 
     # 필터링 적용
@@ -235,7 +235,6 @@ if sales_file and onhand_file:
         '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지'
     ]
 
-    # 데이터 서식 적용
     df_sales_disp = df_filtered[sales_report_cols].copy()
 
     st.dataframe(
@@ -280,7 +279,7 @@ if sales_file and onhand_file:
         hide_index=True
     )
 
-    # 📥 엑셀 보조 다운로드 버튼 (추가 편의기능)
+    # 📥 엑셀 보조 다운로드 버튼
     tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
     st.download_button(
         label="📥 E1 복붙용 데이터 파일 다운로드 (.tsv)",
