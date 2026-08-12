@@ -223,12 +223,12 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
 
     # ---------------------------------------------------------
-    # 1️⃣ AgGrid 설정 (오류 수정 및 노랑/빨강 배경색 추가)
+    # 1️⃣ AgGrid 설정 (KeyError 방지용 Location 추가 및 간격 조절)
     # ---------------------------------------------------------
-    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지']
+    # 🚨 KeyError 방지를 위해 Location 필수 포함
+    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지']
     df_sales_disp = df_curr[sales_cols].copy()
 
-    # 셀 색상 지정을 위한 JS 스크립트
     cell_style_js = JsCode("""
     function(params) {
         if (params.data.상태메시지.includes('부족') || params.data.상태메시지.includes('🚨')) {
@@ -241,7 +241,24 @@ if sales_file and onhand_file:
     }
     """)
 
-    # 컬럼 정의 생성
+    # 컬럼별 최적화 권장 너비 지정
+    col_widths = {
+        '구분': 80,
+        'Date': 100,
+        'Customer': 110,
+        'bill to': 110,
+        'Ship to': 110,
+        '제품코드': 100,
+        '제품명': 160,
+        '수량': 70,
+        '단가': 80,
+        'Total Amount': 100,
+        '매입확인': 80,
+        'LOT': 100,
+        'Location': 80,
+        '상태메시지': 180
+    }
+
     column_defs = []
     for col in df_sales_disp.columns:
         col_config = {
@@ -250,14 +267,15 @@ if sales_file and onhand_file:
             "sortable": True,
             "filter": "agNumberColumnFilter" if col in ['수량', '단가', 'Total Amount'] else "agTextColumnFilter",
             "resizable": True,
+            "width": col_widths.get(col, 100),
             "cellStyle": cell_style_js
         }
         if col == df_sales_disp.columns[0]:
             col_config["checkboxSelection"] = True
             col_config["headerCheckboxSelection"] = True
+            col_config["width"] = 100
         column_defs.append(col_config)
 
-    # 딕셔너리로 gridOptions 구성 (Builder 오류 우회)
     grid_options = {
         "columnDefs": column_defs,
         "rowSelection": "multiple",
@@ -268,12 +286,13 @@ if sales_file and onhand_file:
         }
     }
 
+    # fit_columns_on_grid_load=True 로 설정하여 화면 폭에 맞춰 컬럼 너비 타이트하게 자동 조절
     grid_response = AgGrid(
         df_sales_disp,
         gridOptions=grid_options,
         height=320,
         theme='balham',
-        fit_columns_on_grid_load=False,
+        fit_columns_on_grid_load=True,
         allow_unsafe_jscode=True,
         key=f"grid_{selected_cust}"
     )
@@ -285,7 +304,7 @@ if sales_file and onhand_file:
         st.caption("🔴 **빨간색**: E1 재고 부족건")
 
     # ---------------------------------------------------------
-    # 2️⃣ 복붙용 클립보드 생성 영역 (100% 드래그 가능)
+    # 2️⃣ 복붙용 클립보드 생성 영역 (KeyError 완전 해결)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
@@ -313,7 +332,6 @@ if sales_file and onhand_file:
 
             st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
-            # Pure Streamlit DataFrame (복사/드래그 100% 가능)
             st.dataframe(
                 df_e1,
                 use_container_width=True,
