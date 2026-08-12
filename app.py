@@ -19,7 +19,7 @@ with col_up2:
     onhand_file = st.file_uploader("2. Inventory On-Hand Report 업로드 (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="onhand")
 
 # ---------------------------------------------------------
-# 2. 캐싱 처리된 데이터 매칭 엔진 (None 값 원천 차단)
+# 2. 캐싱 처리된 데이터 매칭 엔진
 # ---------------------------------------------------------
 @st.cache_data(show_spinner="데이터 매칭 처리 중...")
 def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_file_name):
@@ -28,21 +28,20 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     else:
         df_sales = pd.read_csv(sales_file_bytes)
 
-    # 문자열 처리 및 숫자 변환 보정 함수
     def clean_num(val):
         if pd.isna(val):
-            return 0.0
+            return 0
         s = str(val).replace(',', '').strip()
         try:
-            return float(s)
+            return int(float(s))
         except ValueError:
-            return 0.0
+            return 0
 
     def clean_str(val):
         if pd.isna(val) or val is None:
             return ""
         s = str(val).strip()
-        return "" if s.lower() == "none" or s.lower() == "nan" else s
+        return "" if s.lower() in ["none", "nan", "<na>"] else s
 
     def is_order_completed(val):
         if pd.isna(val):
@@ -54,7 +53,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     df_sales['category_clean'] = df_sales['구분'].astype(str).str.strip()
     is_not_move = ~df_sales['category_clean'].str.contains('이동|재고이동', na=False)
     
-    # 수량 전처리
     df_sales['수량_num'] = df_sales['수량'].apply(clean_num)
     
     df_sales_valid = df_sales[
@@ -113,7 +111,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
         raw_date = s_row.get('Date', '')
         clean_date = pd.to_datetime(raw_date, errors='coerce').strftime('%Y-%m-%d') if pd.notna(raw_date) else str(raw_date).split(' ')[0]
-        if clean_date.lower() == 'nat' or clean_date.lower() == 'none':
+        if clean_date.lower() in ['nat', 'none']:
             clean_date = ""
 
         target_location = 'RET' if '반품' in category else 'PRI'
@@ -138,9 +136,9 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
             'Ship to': clean_str(s_row.get('Ship to ', '')),
             '제품코드': item_code,
             '제품명': clean_str(s_row.get('제품명', '')),
-            '수량': int(req_qty),
-            '단가': int(unit_price),
-            'Total Amount': int(req_qty * unit_price),
+            '수량': req_qty,
+            '단가': unit_price,
+            'Total Amount': req_qty * unit_price,
             '매입확인': clean_str(s_row.get('매입확인', '')),
             'Channel': clean_str(s_row.get('Channel', '')),
             'Location': target_location
@@ -235,9 +233,9 @@ if sales_file and onhand_file:
     )
 
     if selected_cust == "📊 전체 모아보기":
-        df_curr = df_result.copy()
+        df_curr = df_result.copy().reset_index(drop=True)
     else:
-        df_curr = df_result[df_result['Customer'] == selected_cust].copy()
+        df_curr = df_result[df_result['Customer'] == selected_cust].copy().reset_index(drop=True)
 
     tot_qty = df_curr['수량'].sum()
     tot_amt = df_curr['Total Amount'].sum()
@@ -246,87 +244,64 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
 
     # ---------------------------------------------------------
-    # 1️⃣ 순정 Streamlit data_editor
+    # 1️⃣ 순정 st.dataframe 네이티브 행 선택 기능 사용 (None 버그 완전 해결)
     # ---------------------------------------------------------
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지']
-    
     df_sales_disp = df_curr[sales_cols].copy()
-    df_sales_disp.insert(0, "선택", True)
 
-    column_config = {
-        "선택": st.column_config.CheckboxColumn("선택", default=True, width="small"),
-        "구분": st.column_config.TextColumn("구분", width="small"),
-        "Date": st.column_config.TextColumn("Date", width="small"),
-        "Customer": st.column_config.TextColumn("Customer", width="medium"),
-        "bill to": st.column_config.TextColumn("bill to", width="medium"),
-        "Ship to": st.column_config.TextColumn("Ship to", width="medium"),
-        "제품코드": st.column_config.TextColumn("제품코드", width="small"),
-        "제품명": st.column_config.TextColumn("제품명", width="large"),
-        "수량": st.column_config.NumberColumn("수량", width="small", format="%d"),
-        "단가": st.column_config.NumberColumn("단가", width="small", format="%d"),
-        "Total Amount": st.column_config.NumberColumn("Total Amount", width="medium", format="%d"),
-        "매입확인": st.column_config.TextColumn("매입확인", width="small"),
-        "LOT": st.column_config.TextColumn("LOT", width="medium"),
-        "Location": st.column_config.TextColumn("Location", width="small"),
-        "상태메시지": st.column_config.TextColumn("상태메시지", width="large"),
-    }
-
-    edited_df = st.data_editor(
+    # Streamlit 최신 네이티브 선택 기능 적용
+    event = st.dataframe(
         df_sales_disp,
-        column_config=column_config,
-        hide_index=True,
         use_container_width=True,
-        key=f"editor_{selected_cust}"
+        hide_index=True,
+        selection_mode="multi_row",
+        on_select="rerun",
+        key=f"grid_{selected_cust}"
     )
 
-    st.caption("💡 **Tip:** 표 상단 왼쪽 체크박스를 선택/해제하여 입력할 항목을 제어할 수 있습니다.")
+    selected_rows = event.selection.rows
 
     # ---------------------------------------------------------
-    # 2️⃣ 복붙용 클립보드 생성 영역 (None 완전 제거 보장)
+    # 2️⃣ 복붙용 클립보드 생성 영역
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
 
-    if st.button("📋 선택한 행으로 E1 복붙용 클립보드 표 생성하기", type="primary", use_container_width=True):
-        df_selected = edited_df[edited_df["선택"] == True].copy()
+    # 아무것도 선택하지 않았을 때는 기본적으로 전체 선택 상태로 간주
+    if len(selected_rows) == 0:
+        df_selected = df_sales_disp.copy()
+        st.caption("💡 **Tip:** 위 표에서 특정 행을 클릭(Shift/Ctrl 조합 가능)하면 원하는 행만 선택할 수 있습니다. (현재 전체 선택됨)")
+    else:
+        df_selected = df_sales_disp.iloc[selected_rows].copy()
+        st.caption(f"💡 현재 **{len(df_selected)}개 행**이 선택되었습니다.")
 
-        if df_selected.empty:
-            st.warning("⚠️ 위 표에서 E1에 입력할 행을 1개 이상 체크해 주세요.")
-        else:
-            df_e1 = pd.DataFrame()
-            
-            # None 방지를 위한 안전 변환 함수
-            def safe_col(df, col_name, is_num=False):
-                if col_name not in df.columns:
-                    return [0 if is_num else ""] * len(df)
-                s = df[col_name].fillna(0 if is_num else "")
-                if is_num:
-                    return pd.to_numeric(s, errors='coerce').fillna(0).astype(int)
-                return s.astype(str).replace({'None': '', 'nan': '', 'NaN': ''})
+    df_e1 = pd.DataFrame()
+    df_e1['Line Number'] = ""
+    df_e1['Item  Number'] = df_selected['제품코드'].astype(str)
+    df_e1['Description'] = ""
+    df_e1['Quantity Ordered'] = df_selected['수량'].astype(int)
+    df_e1['Unit Price'] = df_selected['단가'].astype(int)
+    df_e1['Extended Price'] = df_selected['Total Amount'].astype(int)
+    df_e1['Last Status'] = ""
+    df_e1['Lot Number'] = df_selected['LOT'].astype(str)
+    df_e1['Requested Date'] = ""
+    df_e1['Location'] = df_selected['Location'].astype(str)
 
-            df_e1['Line Number'] = [''] * len(df_selected)
-            df_e1['Item  Number'] = safe_col(df_selected, '제품코드')
-            df_e1['Description'] = [''] * len(df_selected)
-            df_e1['Quantity Ordered'] = safe_col(df_selected, '수량', is_num=True)
-            df_e1['Unit Price'] = safe_col(df_selected, '단가', is_num=True)
-            df_e1['Extended Price'] = df_e1['Quantity Ordered'] * df_e1['Unit Price']
-            df_e1['Last Status'] = [''] * len(df_selected)
-            df_e1['Lot Number'] = safe_col(df_selected, 'LOT')
-            df_e1['Requested Date'] = [''] * len(df_selected)
-            df_e1['Location'] = safe_col(df_selected, 'Location')
+    # 문자열로 변환된 데이터 중 혹시 남아있을 'nan'이나 'None'을 빈 값으로 최종 청소
+    df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '<NA>', np.nan: ''})
 
-            st.success(f"✅ 선택한 **{len(df_e1):,}개 행**이 정상 변환되었습니다. 마우스로 드래그 후 `Ctrl+C` 하세요.")
+    st.success(f"✅ 변환 완료: **총 {len(df_e1):,}개 행**. 아래 표를 마우스로 드래그 후 `Ctrl+C` 하세요.")
 
-            st.dataframe(
-                df_e1,
-                use_container_width=True,
-                hide_index=True
-            )
+    st.dataframe(
+        df_e1,
+        use_container_width=True,
+        hide_index=True
+    )
 
-            tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 선택 건 E1 복붙용 파일 다운로드 (.tsv)",
-                data=tsv_data,
-                file_name=f"E1_Upload_{selected_cust}.tsv",
-                mime="text/tab-separated-values"
-            )
+    tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
+    st.download_button(
+        label="📥 E1 복붙용 파일 다운로드 (.tsv)",
+        data=tsv_data,
+        file_name=f"E1_Upload_{selected_cust}.tsv",
+        mime="text/tab-separated-values"
+    )
