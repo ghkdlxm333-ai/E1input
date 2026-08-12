@@ -28,8 +28,9 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     else:
         df_sales = pd.read_csv(sales_file_bytes)
 
+    # 전처리 및 결측치 제어용 내부 함수
     def clean_num(val):
-        if pd.isna(val):
+        if pd.isna(val) or val is None:
             return 0
         s = str(val).replace(',', '').strip()
         try:
@@ -164,7 +165,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
 
-        # 2차 매칭 (FIFO)
+        # 2차 매칭 (FIFO 선입선출)
         if req_qty > 0:
             for _, inv_row in item_inv.iterrows():
                 cur_lot = inv_row['Lot Number']
@@ -215,7 +216,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
-# 3. 메인 화면 구성
+# 3. 메인 화면 구성 및 인터랙션
 # ---------------------------------------------------------
 if sales_file and onhand_file:
     df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
@@ -244,17 +245,17 @@ if sales_file and onhand_file:
     st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
 
     # ---------------------------------------------------------
-    # 1️⃣ 순정 st.dataframe 네이티브 행 선택 기능 사용 (None 버그 완전 해결)
+    # 1️⃣ 순정 st.dataframe 네이티브 행 선택 기능 적용
     # ---------------------------------------------------------
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지']
     df_sales_disp = df_curr[sales_cols].copy()
 
-    # Streamlit 최신 네이티브 선택 기능 적용
+    # 인덱스 기반 선택 기능 (Python 3.14 및 최신 Streamlit 호환 규격)
     event = st.dataframe(
         df_sales_disp,
         use_container_width=True,
         hide_index=True,
-        selection_mode="multi_row",
+        selection_mode=["multi-row"],
         on_select="rerun",
         key=f"grid_{selected_cust}"
     )
@@ -262,15 +263,15 @@ if sales_file and onhand_file:
     selected_rows = event.selection.rows
 
     # ---------------------------------------------------------
-    # 2️⃣ 복붙용 클립보드 생성 영역
+    # 2️⃣ 복붙용 클립보드 생성 영역 (None 원천 차단)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
 
-    # 아무것도 선택하지 않았을 때는 기본적으로 전체 선택 상태로 간주
+    # 행 선택 상태 조건식 처리
     if len(selected_rows) == 0:
         df_selected = df_sales_disp.copy()
-        st.caption("💡 **Tip:** 위 표에서 특정 행을 클릭(Shift/Ctrl 조합 가능)하면 원하는 행만 선택할 수 있습니다. (현재 전체 선택됨)")
+        st.caption("💡 **Tip:** 위 표에서 원하는 행을 클릭(Shift/Ctrl로 다중 선택)할 수 있습니다. (기본값: 전체 선택)")
     else:
         df_selected = df_sales_disp.iloc[selected_rows].copy()
         st.caption(f"💡 현재 **{len(df_selected)}개 행**이 선택되었습니다.")
@@ -287,10 +288,10 @@ if sales_file and onhand_file:
     df_e1['Requested Date'] = ""
     df_e1['Location'] = df_selected['Location'].astype(str)
 
-    # 문자열로 변환된 데이터 중 혹시 남아있을 'nan'이나 'None'을 빈 값으로 최종 청소
-    df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '<NA>', np.nan: ''})
+    # 마감 단계에서 None/NaN 문자열 최종 마스킹
+    df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
 
-    st.success(f"✅ 변환 완료: **총 {len(df_e1):,}개 행**. 아래 표를 마우스로 드래그 후 `Ctrl+C` 하세요.")
+    st.success(f"✅ 변환 완료: **총 {len(df_e1):,}개 행**. 아래 표를 드래그 후 `Ctrl+C` 하세요.")
 
     st.dataframe(
         df_e1,
