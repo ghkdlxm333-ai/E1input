@@ -5,7 +5,7 @@ import numpy as np
 st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
 
 st.title("📦 E1(JD Edwards) 입력 자동화 & 재고 거름망 시스템")
-st.caption("세일즈 리포트 건 중 이미 완료된 건(Order # 6자리)은 자동 제외하며, Inventory On-Hand Report와 매칭하여 바로 복붙 가능한 데이터를 생성합니다.")
+st.caption("세일즈 리포트의 매출/반품 건을 확인하고, Inventory On-Hand Report와 매칭하여 E1에 즉시 복붙 가능한 클립보드를 생성합니다.")
 
 # ---------------------------------------------------------
 # 1. 파일 업로드 영역
@@ -36,18 +36,22 @@ if sales_file and onhand_file:
     def is_order_completed(val):
         if pd.isna(val):
             return False
-        val_str = str(val).strip().split('.')[0] # 소수점 제거
+        val_str = str(val).strip().split('.')[0]
         return len(val_str) == 6 and val_str.isdigit()
 
-    # 미입력건만 추출
     df_sales['is_completed'] = df_sales['Order #'].apply(is_order_completed)
-    df_sales_valid = df_sales[(~df_sales['is_completed']) & (pd.to_numeric(df_sales['수량'], errors='coerce') > 0)].copy()
+    
+    # 미입력건 + 수량>0 + [재고이동 제외, 매출/반품만 포함]
+    df_sales['category_clean'] = df_sales['구분'].astype(str).str.strip()
+    is_not_move = ~df_sales['category_clean'].str.contains('이동|재고이동', na=False)
+    
+    df_sales_valid = df_sales[
+        (~df_sales['is_completed']) & 
+        (pd.to_numeric(df_sales['수량'], errors='coerce') > 0) & 
+        is_not_move
+    ].copy()
 
-    st.sidebar.metric("총 출고건수", len(df_sales))
-    st.sidebar.metric("입력 필요건수 (Order # 없음)", len(df_sales_valid))
-    st.sidebar.metric("완료건수 (자동제외)", len(df_sales) - len(df_sales_valid))
-
-    # B. Inventory On-Hand Report 로드 (인코딩 및 헤더 위치 자동 파악)
+    # B. Inventory On-Hand Report 로드
     df_onhand_raw = None
     try:
         if onhand_file.name.endswith('.csv'):
@@ -91,7 +95,6 @@ if sales_file and onhand_file:
     # ---------------------------------------------------------
     # 3. 매칭 엔진 (구분별 Location 및 LOT 수량 검증)
     # ---------------------------------------------------------
-    # (Item Number, Location, Lot Number) -> Qty
     inventory_pool = {}
     for _, row in df_onhand[df_onhand['On-Hand Qty'] > 0].iterrows():
         key = (row['Item Number'], row['Location'], row['Lot Number'])
@@ -106,13 +109,8 @@ if sales_file and onhand_file:
         sales_lot = str(s_row.get('LOT', '')).strip() if pd.notna(s_row.get('LOT')) else ''
         category = str(s_row.get('구분', '')).strip()
 
-        # Location 자동 결정
-        if '반품' in category:
-            target_location = 'RET'
-        elif '이동' in category or '재고이동' in category:
-            target_location = 'REP2'
-        else:
-            target_location = 'PRI'
+        # Location 지정: 매출 -> PRI, 반품 -> RET
+        target_location = 'RET' if '반품' in category else 'PRI'
 
         # E1 Item Number 매핑 (K 접두사 대응)
         if not df_onhand[df_onhand['Item Number'] == item_code].empty:
@@ -122,39 +120,42 @@ if sales_file and onhand_file:
         else:
             e1_item_code = item_code
 
-        # 해당 품목 & Location 재고 목록 (FEFO 순)
         item_inv = df_onhand[
             (df_onhand['Item Number'] == e1_item_code) & 
             (df_onhand['Location'] == target_location)
         ].sort_values(by='Lot Expiration Date')
+
+        # 공통 세일즈 리포트 속성
+        sales_base = {
+            '구분': category,
+            'Date': s_row.get('Date', ''),
+            'Customer': s_row.get('Customer', ''),
+            'bill to': s_row.get('bill to ', s_row.get('Ship to ', '')),
+            'Ship to': s_row.get('Ship to ', ''),
+            '제품코드': item_code,
+            '제품명': s_row.get('제품명', ''),
+            '단가': unit_price,
+            'Total Amount': s_row.get('Total Amount', req_qty * unit_price),
+            '매입확인': s_row.get('매입확인', ''),
+            'Channel': s_row.get('Channel', ''),
+            'Location': target_location
+        }
 
         # 1차 시도: 세일즈 LOT 매칭
         key_sales = (e1_item_code, target_location, sales_lot)
         if sales_lot and key_sales in inventory_pool and inventory_pool[key_sales] > 0:
             avail = inventory_pool[key_sales]
             use_qty = min(req_qty, avail)
-
             status_flag = "NORMAL" if use_qty == req_qty else "SPLIT"
 
-            processed_rows.append({
-                'Line Number': '',
-                'Item  Number': item_code,
-                'Description': s_row.get('제품명', ''),
-                'Quantity Ordered': use_qty,
-                'Unit Price': unit_price,
-                'Extended Price': use_qty * unit_price,
-                'Last Status': '',
-                'Lot Number': sales_lot,
-                'Requested Date': s_row.get('Date', ''),
-                'Location': target_location,
-                'Date': s_row.get('Date', ''),
-                'Channel': s_row.get('Channel', ''),
-                'Customer': s_row.get('Customer', ''),
-                'Sold To (bill to)': s_row.get('bill to ', s_row.get('Ship to ', '')),
-                'Ship To': s_row.get('Ship to ', ''),
+            row_data = sales_base.copy()
+            row_data.update({
+                '수량': use_qty,
+                'LOT': sales_lot,
                 '상태구분': status_flag,
                 '상태메시지': '정상 매칭' if status_flag == "NORMAL" else '수량 부족으로 LOT 분할'
             })
+            processed_rows.append(row_data)
 
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
@@ -171,25 +172,14 @@ if sales_file and onhand_file:
 
                 use_qty = min(req_qty, avail)
                 
-                processed_rows.append({
-                    'Line Number': '',
-                    'Item  Number': item_code,
-                    'Description': s_row.get('제품명', ''),
-                    'Quantity Ordered': use_qty,
-                    'Unit Price': unit_price,
-                    'Extended Price': use_qty * unit_price,
-                    'Last Status': '',
-                    'Lot Number': cur_lot,
-                    'Requested Date': s_row.get('Date', ''),
-                    'Location': target_location,
-                    'Date': s_row.get('Date', ''),
-                    'Channel': s_row.get('Channel', ''),
-                    'Customer': s_row.get('Customer', ''),
-                    'Sold To (bill to)': s_row.get('bill to ', s_row.get('Ship to ', '')),
-                    'Ship To': s_row.get('Ship to ', ''),
+                row_data = sales_base.copy()
+                row_data.update({
+                    '수량': use_qty,
+                    'LOT': cur_lot,
                     '상태구분': 'REPLACED' if sales_lot != cur_lot else 'SPLIT',
                     '상태메시지': f'LOT 자동 변경 ({sales_lot} ➡️ {cur_lot})'
                 })
+                processed_rows.append(row_data)
 
                 inventory_pool[key_cur] -= use_qty
                 req_qty -= use_qty
@@ -199,33 +189,22 @@ if sales_file and onhand_file:
 
         # 3차: 재고 전량 부족
         if req_qty > 0:
-            processed_rows.append({
-                'Line Number': '',
-                'Item  Number': item_code,
-                'Description': s_row.get('제품명', ''),
-                'Quantity Ordered': req_qty,
-                'Unit Price': unit_price,
-                'Extended Price': req_qty * unit_price,
-                'Last Status': '',
-                'Lot Number': sales_lot if sales_lot else '재고없음',
-                'Requested Date': s_row.get('Date', ''),
-                'Location': target_location,
-                'Date': s_row.get('Date', ''),
-                'Channel': s_row.get('Channel', ''),
-                'Customer': s_row.get('Customer', ''),
-                'Sold To (bill to)': s_row.get('bill to ', s_row.get('Ship to ', '')),
-                'Ship To': s_row.get('Ship to ', ''),
+            row_data = sales_base.copy()
+            row_data.update({
+                '수량': req_qty,
+                'LOT': sales_lot if sales_lot else '재고없음',
                 '상태구분': 'SHORTAGE',
                 '상태메시지': f'🚨 E1 {target_location} 재고 부족 ({req_qty}개 부족)'
             })
+            processed_rows.append(row_data)
 
     df_result = pd.DataFrame(processed_rows)
 
     # ---------------------------------------------------------
-    # 4. 조회 필터 및 E1 클립보드 출력
+    # 4. 조회 필터 및 그리드 출력
     # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("🔍 E1 입력 대상 조회 & 검색 필터")
+    st.subheader("🔍 세일즈 리포트 조회 & 필터")
 
     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
 
@@ -242,8 +221,8 @@ if sales_file and onhand_file:
         sel_customer = st.selectbox("Customer 선택:", customers)
 
     with f_col4:
-        sold_tos = ['전체'] + list(df_result['Sold To (bill to)'].dropna().astype(str).unique())
-        sel_sold_to = st.selectbox("Sold To (bill to) 선택:", sold_tos)
+        sold_tos = ['전체'] + list(df_result['bill to'].dropna().astype(str).unique())
+        sel_sold_to = st.selectbox("bill to 선택:", sold_tos)
 
     # 필터링 적용
     df_filtered = df_result.copy()
@@ -254,67 +233,68 @@ if sales_file and onhand_file:
     if sel_customer != '전체':
         df_filtered = df_filtered[df_filtered['Customer'] == sel_customer]
     if sel_sold_to != '전체':
-        df_filtered = df_filtered[df_filtered['Sold To (bill to)'].astype(str) == sel_sold_to]
+        df_filtered = df_filtered[df_filtered['bill to'].astype(str) == sel_sold_to]
 
     # Header 상단 배치
     if not df_filtered.empty:
         h1, h2, h3 = st.columns(3)
         with h1:
-            st.info(f"**Sold To:** `{df_filtered['Sold To (bill to)'].iloc[0]}`")
+            st.info(f"**bill to (Sold To):** `{df_filtered['bill to'].iloc[0]}`")
         with h2:
-            st.info(f"**Ship To:** `{df_filtered['Ship To'].iloc[0]}`")
+            st.info(f"**Ship to:** `{df_filtered['Ship to'].iloc[0]}`")
         with h3:
-            st.info(f"**선택 건수:** `{len(df_filtered)}행`")
+            st.info(f"**조회 건수:** `{len(df_filtered)}행`")
 
-    # 노출용 컬럼 정리
-    display_cols = [
-        'Item  Number', 'Description', 'Quantity Ordered', 'Unit Price', 'Extended Price', 
-        'Lot Number', 'Location', '상태메시지'
+    # ---------------------------------------------------------
+    # 1st GRID: 세일즈 리포트 형태 그리드
+    # ---------------------------------------------------------
+    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (매출/반품 전용)")
+
+    sales_report_cols = [
+        '구분', 'Date', 'Customer', 'bill to', 'Ship to', 
+        '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT'
     ]
 
-    # ✅ 완전 해결된 스타일 지정 함수 (axis=None 방식)
-    def apply_grid_styles(df_in):
-        # 스타일용 데이터프레임 초기화
-        styles = pd.DataFrame('', index=df_in.index, columns=display_cols)
-        
+    def apply_sales_styles(df_in):
+        styles = pd.DataFrame('', index=df_in.index, columns=sales_report_cols)
         for idx in df_in.index:
             flag = df_in.loc[idx, '상태구분']
             if flag == 'SHORTAGE':
-                bg_style = 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold;' # 빨강
+                bg_style = 'background-color: #ffcdd2; color: #b71c1c; font-weight: bold;'
             elif flag in ['SPLIT', 'REPLACED']:
-                bg_style = 'background-color: #fff9c4; color: #f57f17; font-weight: bold;' # 노랑
+                bg_style = 'background-color: #fff9c4; color: #f57f17; font-weight: bold;'
             else:
                 bg_style = ''
             
-            for col in display_cols:
+            for col in sales_report_cols:
                 styles.loc[idx, col] = bg_style
-                
         return styles
 
-    st.subheader("📋 세일즈 및 E1 매칭 확인 그리드")
-
-    # 화면 표시용 컬럼만 자르고, 전체 df_filtered 정보를 참조하여 스타일 적용
     st.dataframe(
-        df_filtered[display_cols].style.apply(lambda _: apply_grid_styles(df_filtered), axis=None),
+        df_filtered[sales_report_cols].style.apply(lambda _: apply_sales_styles(df_filtered), axis=None),
         use_container_width=True
     )
 
-    # E1 입력창 순서 10개 컬럼 (e1 입력창.csv 1:1 맞춤)
-    e1_grid_cols = [
-        'Line Number', 'Item  Number', 'Description', 'Quantity Ordered', 
-        'Unit Price', 'Extended Price', 'Last Status', 'Lot Number', 
-        'Requested Date', 'Location'
-    ]
-
-    # Date 포맷 정리
-    df_e1_copy = df_filtered[e1_grid_cols].copy()
-    df_e1_copy['Requested Date'] = pd.to_datetime(df_e1_copy['Requested Date'], errors='coerce').dt.strftime('%Y/%m/%d').fillna('')
-
-    # TSV 생성 (Header 제외, Tab 구분자)
-    tsv_output = df_e1_copy.to_csv(sep='\t', index=False, header=False)
-
+    # ---------------------------------------------------------
+    # 2nd GRID: E1 입력창 규격 복붙 클립보드 (4개 열 공란 처리)
+    # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("📋 E1 붙여넣기용 클립보드 (E1 Grid 동일 규격)")
+    st.subheader("2️⃣ E1 입력창 복붙용 클립보드 (E1 Grid 동일 규격)")
+
+    df_e1 = pd.DataFrame()
+    df_e1['Line Number'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
+    df_e1['Item  Number'] = df_filtered['제품코드']
+    df_e1['Description'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
+    df_e1['Quantity Ordered'] = df_filtered['수량']
+    df_e1['Unit Price'] = df_filtered['단가']
+    df_e1['Extended Price'] = df_filtered['수량'] * df_filtered['단가']
+    df_e1['Last Status'] = [''] * len(df_filtered)        # 공란 (ERP 자동생성)
+    df_e1['Lot Number'] = df_filtered['LOT']
+    df_e1['Requested Date'] = [''] * len(df_filtered)     # 공란 (ERP 자동생성)
+    df_e1['Location'] = df_filtered['Location']
+
+    # Tab 구분자 생성 (Header 제외)
+    tsv_output = df_e1.to_csv(sep='\t', index=False, header=False)
+
     st.write("👉 아래 박스 클릭 ➡️ `Ctrl+A` ➡️ `Ctrl+C` 후 E1 그리드 첫 칸(`Line Number` 또는 `Item Number`)에 `Ctrl+V` 하세요.")
-    
     st.text_area("E1 복붙 텍스트 (Tab 구분)", value=tsv_output, height=200)
