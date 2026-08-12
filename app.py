@@ -157,14 +157,14 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                 'Total Amount': int(use_qty * unit_price),
                 'LOT': sales_lot,
                 '상태구분': status_flag,
-                '상태메시지': '정상 매칭' if status_flag == "NORMAL" else f'⚠️ 수량 부족으로 LOT 분할 ({sales_lot})'
+                '상태메시지': '정상 매칭' if status_flag == "NORMAL" else f'⚠️ LOT 분할 ({sales_lot})'
             })
             processed_rows.append(row_data)
 
             inventory_pool[key_sales] -= use_qty
             req_qty -= use_qty
 
-        # 2차 매칭 (FIFO 선입선출)
+        # 2차 매칭 (FIFO 선입선출 - 분할 건은 분할된 수량/LOT로 행 추가 생성)
         if req_qty > 0:
             for _, inv_row in item_inv.iterrows():
                 cur_lot = inv_row['Lot Number']
@@ -176,12 +176,9 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
                 use_qty = min(req_qty, avail)
                 
-                if sales_lot != cur_lot and sales_lot != '':
-                    msg = f'⚠️ LOT 변경 ({sales_lot} ➡️ {cur_lot})'
-                    st_flag = 'REPLACED'
-                else:
-                    msg = f'⚠️ LOT 분할 선입선출 ({cur_lot})'
-                    st_flag = 'SPLIT'
+                # LOT 분할 발생 시 SPLIT 플래그
+                msg = f'⚠️ LOT 분할 선입선출 ({cur_lot})'
+                st_flag = 'SPLIT'
 
                 row_data = sales_base.copy()
                 row_data.update({
@@ -219,10 +216,10 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 # ---------------------------------------------------------
 def highlight_status(row):
     status = str(row.get('상태구분', ''))
-    if status in ['SPLIT', 'REPLACED']:
-        return ['background-color: #FFF3CD; color: #856404; font-weight: bold;'] * len(row) # 노란색 (경고)
+    if status == 'SPLIT':
+        return ['background-color: #FFF3CD; color: #856404; font-weight: bold;'] * len(row) # 노란색 (LOT 분할만 강조)
     elif status == 'SHORTAGE':
-        return ['background-color: #F8D7DA; color: #721C24; font-weight: bold;'] * len(row) # 빨간색 (부족)
+        return ['background-color: #F8D7DA; color: #721C24; font-weight: bold;'] * len(row) # 빨간색 (재고 부족)
     return [''] * len(row)
 
 
@@ -256,7 +253,7 @@ if sales_file and onhand_file:
     if selected_cats:
         df_curr = df_curr[df_curr['구분'].isin(selected_cats)].copy()
     else:
-        df_curr = df_curr.iloc[0:0] # 아무것도 선택하지 않았을 경우 빈 데이터프레임
+        df_curr = df_curr.iloc[0:0]
 
     df_curr = df_curr.reset_index(drop=True)
 
@@ -264,56 +261,58 @@ if sales_file and onhand_file:
     tot_amt = df_curr['Total Amount'].sum() if not df_curr.empty else 0
     
     st.subheader(f"📌 [{selected_cust}] 세일즈 리포트 매칭 결과")
-    st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`  |  🟡 **노란색:** LOT 변경/분할  |  🔴 **빨간색:** 재고 부족")
+    st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`  |  🟡 **노란색:** LOT 분할  |  🔴 **빨간색:** 재고 부족 (복붙 제외됨)")
 
     # ---------------------------------------------------------
-    # 1️⃣ 상단 세일즈 리포트 결과 (행 색상 칠하기 적용)
+    # 1️⃣ 상단 세일즈 리포트 결과 (상태 점검용)
     # ---------------------------------------------------------
     sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지', '상태구분']
     df_sales_disp = df_curr[sales_cols].copy()
 
-    # 화면 표시 시 스타일 적용
     styled_sales_df = df_sales_disp.style.apply(highlight_status, axis=1)
 
     st.dataframe(
         styled_sales_df,
         use_container_width=True,
         hide_index=True,
-        column_config={"상태구분": None} # 내부 상태 로직 컬럼은 감춤
+        column_config={"상태구분": None}
     )
 
     # ---------------------------------------------------------
-    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (자동 생성 및 색상 적용)
+    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (SHORTAGE 자동 제외 & SPLIT 분할 행 반영)
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("2️⃣ E1 입력창 복붙용 클립보드 표")
 
+    # 재고 부족(SHORTAGE) 건 제외 처리
+    df_e1_valid = df_curr[df_curr['상태구분'] != 'SHORTAGE'].copy().reset_index(drop=True)
+
     df_e1 = pd.DataFrame()
-    if not df_curr.empty:
+    if not df_e1_valid.empty:
         df_e1['Line Number'] = ""
-        df_e1['Item  Number'] = df_curr['제품코드'].astype(str)
+        df_e1['Item  Number'] = df_e1_valid['제품코드'].astype(str)
         df_e1['Description'] = ""
-        df_e1['Quantity Ordered'] = df_curr['수량'].astype(int)
-        df_e1['Unit Price'] = df_curr['단가'].astype(int)
-        df_e1['Extended Price'] = df_curr['Total Amount'].astype(int)
+        df_e1['Quantity Ordered'] = df_e1_valid['수량'].astype(int)
+        df_e1['Unit Price'] = df_e1_valid['단가'].astype(int)
+        df_e1['Extended Price'] = df_e1_valid['Total Amount'].astype(int)
         df_e1['Last Status'] = ""
-        df_e1['Lot Number'] = df_curr['LOT'].astype(str)
+        df_e1['Lot Number'] = df_e1_valid['LOT'].astype(str)
         df_e1['Requested Date'] = ""
-        df_e1['Location'] = df_curr['Location'].astype(str)
-        df_e1['상태구분'] = df_curr['상태구분']
+        df_e1['Location'] = df_e1_valid['Location'].astype(str)
+        df_e1['상태구분'] = df_e1_valid['상태구분']
 
         # 결측치 최종 제거
         df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
 
     styled_e1_df = df_e1.style.apply(highlight_status, axis=1)
 
-    st.success(f"✅ 필터 적용 결과 **총 {len(df_e1):,}개 행**이 준비되었습니다. 마우스로 영역을 드래그 후 `Ctrl+C` 하세요.")
+    st.success(f"✅ E1 즉시 복붙용 **총 {len(df_e1):,}개 행** 준비 완료 (재고부족 건 제외 및 LOT 분할 행 자동 반영). 아래 표를 드래그 후 `Ctrl+C` 하세요.")
 
     st.dataframe(
         styled_e1_df,
         use_container_width=True,
         hide_index=True,
-        column_config={"상태구분": None} # 감춤 처리
+        column_config={"상태구분": None}
     )
 
     tsv_data = df_e1.drop(columns=['상태구분'], errors='ignore').to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
