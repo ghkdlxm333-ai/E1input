@@ -28,7 +28,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     else:
         df_sales = pd.read_csv(sales_file_bytes)
 
-    # 전처리 및 결측치 제어용 내부 함수
     def clean_num(val):
         if pd.isna(val) or val is None:
             return 0
@@ -216,6 +215,18 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
+# 행 색상 강조 스타일 지정 함수
+# ---------------------------------------------------------
+def highlight_status(row):
+    status = str(row.get('상태구분', ''))
+    if status in ['SPLIT', 'REPLACED']:
+        return ['background-color: #FFF3CD; color: #856404; font-weight: bold;'] * len(row) # 노란색 (경고)
+    elif status == 'SHORTAGE':
+        return ['background-color: #F8D7DA; color: #721C24; font-weight: bold;'] * len(row) # 빨간색 (부족)
+    return [''] * len(row)
+
+
+# ---------------------------------------------------------
 # 3. 메인 화면 구성 및 인터랙션
 # ---------------------------------------------------------
 if sales_file and onhand_file:
@@ -225,81 +236,87 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
+    # --- 사이드바 필터 설정 ---
+    st.sidebar.header("🔍 조회 조건 필터")
+    
     customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
-    
-    st.sidebar.header("🏢 거래처 (Customer) 선택")
-    selected_cust = st.sidebar.radio(
-        "입력할 거래처를 선택하세요:",
-        options=["📊 전체 모아보기"] + customers
-    )
+    selected_cust = st.sidebar.radio("🏢 거래처 (Customer) 선택:", options=["📊 전체 모아보기"] + customers)
 
+    # 구분 필터 (매출/샘플/행사/반품 등 다중 선택)
+    categories = sorted([cat for cat in df_result['구분'].unique() if pd.notna(cat) and str(cat).strip() != ''])
+    selected_cats = st.sidebar.multiselect("🏷️ 구분 (중복 선택 가능):", options=categories, default=categories)
+
+    # 데이터 1차 필터링 (거래처)
     if selected_cust == "📊 전체 모아보기":
-        df_curr = df_result.copy().reset_index(drop=True)
+        df_curr = df_result.copy()
     else:
-        df_curr = df_result[df_result['Customer'] == selected_cust].copy().reset_index(drop=True)
+        df_curr = df_result[df_result['Customer'] == selected_cust].copy()
 
-    tot_qty = df_curr['수량'].sum()
-    tot_amt = df_curr['Total Amount'].sum()
+    # 데이터 2차 필터링 (구분)
+    if selected_cats:
+        df_curr = df_curr[df_curr['구분'].isin(selected_cats)].copy()
+    else:
+        df_curr = df_curr.iloc[0:0] # 아무것도 선택하지 않았을 경우 빈 데이터프레임
+
+    df_curr = df_curr.reset_index(drop=True)
+
+    tot_qty = df_curr['수량'].sum() if not df_curr.empty else 0
+    tot_amt = df_curr['Total Amount'].sum() if not df_curr.empty else 0
     
-    st.subheader(f"📌 [{selected_cust}] 세일즈 리포트 확인 및 선택")
-    st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`")
+    st.subheader(f"📌 [{selected_cust}] 세일즈 리포트 매칭 결과")
+    st.info(f"💡 총 **{len(df_curr):,}건**  |  **총 수량:** `{tot_qty:,} 개`  |  **총 금액:** `{tot_amt:,} 원`  |  🟡 **노란색:** LOT 변경/분할  |  🔴 **빨간색:** 재고 부족")
 
     # ---------------------------------------------------------
-    # 1️⃣ 순정 st.dataframe 네이티브 행 선택 기능 적용
+    # 1️⃣ 상단 세일즈 리포트 결과 (행 색상 칠하기 적용)
     # ---------------------------------------------------------
-    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지']
+    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', 'Location', '상태메시지', '상태구분']
     df_sales_disp = df_curr[sales_cols].copy()
 
-    # 인덱스 기반 선택 기능 (Python 3.14 및 최신 Streamlit 호환 규격)
-    event = st.dataframe(
-        df_sales_disp,
-        use_container_width=True,
-        hide_index=True,
-        selection_mode=["multi-row"],
-        on_select="rerun",
-        key=f"grid_{selected_cust}"
-    )
-
-    selected_rows = event.selection.rows
-
-    # ---------------------------------------------------------
-    # 2️⃣ 복붙용 클립보드 생성 영역 (None 원천 차단)
-    # ---------------------------------------------------------
-    st.markdown("---")
-    st.subheader("2️⃣ E1 입력창 복붙용 클립보드 생성")
-
-    # 행 선택 상태 조건식 처리
-    if len(selected_rows) == 0:
-        df_selected = df_sales_disp.copy()
-        st.caption("💡 **Tip:** 위 표에서 원하는 행을 클릭(Shift/Ctrl로 다중 선택)할 수 있습니다. (기본값: 전체 선택)")
-    else:
-        df_selected = df_sales_disp.iloc[selected_rows].copy()
-        st.caption(f"💡 현재 **{len(df_selected)}개 행**이 선택되었습니다.")
-
-    df_e1 = pd.DataFrame()
-    df_e1['Line Number'] = ""
-    df_e1['Item  Number'] = df_selected['제품코드'].astype(str)
-    df_e1['Description'] = ""
-    df_e1['Quantity Ordered'] = df_selected['수량'].astype(int)
-    df_e1['Unit Price'] = df_selected['단가'].astype(int)
-    df_e1['Extended Price'] = df_selected['Total Amount'].astype(int)
-    df_e1['Last Status'] = ""
-    df_e1['Lot Number'] = df_selected['LOT'].astype(str)
-    df_e1['Requested Date'] = ""
-    df_e1['Location'] = df_selected['Location'].astype(str)
-
-    # 마감 단계에서 None/NaN 문자열 최종 마스킹
-    df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
-
-    st.success(f"✅ 변환 완료: **총 {len(df_e1):,}개 행**. 아래 표를 드래그 후 `Ctrl+C` 하세요.")
+    # 화면 표시 시 스타일 적용
+    styled_sales_df = df_sales_disp.style.apply(highlight_status, axis=1)
 
     st.dataframe(
-        df_e1,
+        styled_sales_df,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config={"상태구분": None} # 내부 상태 로직 컬럼은 감춤
     )
 
-    tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
+    # ---------------------------------------------------------
+    # 2️⃣ 하단 E1 입력창 복붙용 클립보드 (자동 생성 및 색상 적용)
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader("2️⃣ E1 입력창 복붙용 클립보드 표")
+
+    df_e1 = pd.DataFrame()
+    if not df_curr.empty:
+        df_e1['Line Number'] = ""
+        df_e1['Item  Number'] = df_curr['제품코드'].astype(str)
+        df_e1['Description'] = ""
+        df_e1['Quantity Ordered'] = df_curr['수량'].astype(int)
+        df_e1['Unit Price'] = df_curr['단가'].astype(int)
+        df_e1['Extended Price'] = df_curr['Total Amount'].astype(int)
+        df_e1['Last Status'] = ""
+        df_e1['Lot Number'] = df_curr['LOT'].astype(str)
+        df_e1['Requested Date'] = ""
+        df_e1['Location'] = df_curr['Location'].astype(str)
+        df_e1['상태구분'] = df_curr['상태구분']
+
+        # 결측치 최종 제거
+        df_e1 = df_e1.replace({'None': '', 'nan': '', 'NaN': '', np.nan: ''})
+
+    styled_e1_df = df_e1.style.apply(highlight_status, axis=1)
+
+    st.success(f"✅ 필터 적용 결과 **총 {len(df_e1):,}개 행**이 준비되었습니다. 마우스로 영역을 드래그 후 `Ctrl+C` 하세요.")
+
+    st.dataframe(
+        styled_e1_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"상태구분": None} # 감춤 처리
+    )
+
+    tsv_data = df_e1.drop(columns=['상태구분'], errors='ignore').to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
     st.download_button(
         label="📥 E1 복붙용 파일 다운로드 (.tsv)",
         data=tsv_data,
