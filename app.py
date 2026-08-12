@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from st_aggrid import AgGrid, GridOptionsBuilder
 
 st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
 
@@ -24,7 +24,6 @@ with col_up2:
 # ---------------------------------------------------------
 @st.cache_data(show_spinner="데이터 매칭 처리 중...")
 def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_file_name):
-    # A. 세일즈 리포트 로드
     if sales_file_name.endswith(('.xlsx', '.xls')):
         df_sales = pd.read_excel(sales_file_bytes, sheet_name='일일출고')
     else:
@@ -46,7 +45,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
         is_not_move
     ].copy()
 
-    # B. Inventory On-Hand Report 로드
     df_onhand_raw = None
     if onhand_file_name.endswith('.csv'):
         encodings = ['utf-8-sig', 'cp949', 'euc-kr', 'utf-8', 'latin1']
@@ -73,7 +71,6 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
     if df_onhand_raw is None:
         return None
 
-    # C. 재고 데이터 전처리
     df_onhand_raw.columns = df_onhand_raw.columns.astype(str).str.strip()
     df_onhand = df_onhand_raw.copy()
     df_onhand['On-Hand Qty'] = pd.to_numeric(df_onhand['On-Hand Qty'], errors='coerce').fillna(0)
@@ -174,7 +171,7 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
                 if req_qty <= 0:
                     break
 
-        # 3차 매칭 (재고 부족)
+        # 3차 매칭
         if req_qty > 0:
             row_data = sales_base.copy()
             row_data.update({
@@ -189,7 +186,75 @@ def process_data(sales_file_bytes, sales_file_name, onhand_file_bytes, onhand_fi
 
 
 # ---------------------------------------------------------
-# 3. 데이터 표시 (초고속 AgGrid 전용 그리드 적용)
+# 3. AgGrid 생성 헬퍼 함수
+# ---------------------------------------------------------
+def render_aggrid_pair(df_target, key_prefix):
+    # 1. 세일즈 리포트 확인 그리드
+    st.markdown("#### 1️⃣ 세일즈 리포트 확인")
+    sales_cols = ['구분', 'Date', 'Customer', 'bill to', 'Ship to', '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지']
+    df_sales_disp = df_target[sales_cols].copy()
+
+    gb1 = GridOptionsBuilder.from_dataframe(df_sales_disp)
+    gb1.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
+    gb1.configure_column("수량", filter='agNumberColumnFilter')
+    gb1.configure_column("단가", filter='agNumberColumnFilter')
+    gb1.configure_column("Total Amount", filter='agNumberColumnFilter')
+    gb1.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
+
+    AgGrid(
+        df_sales_disp,
+        gridOptions=gb1.build(),
+        height=280,
+        theme='balham',
+        fit_columns_on_grid_load=False,
+        key=f"{key_prefix}_grid1"
+    )
+
+    # 2. E1 입력창 복붙용 그리드
+    st.markdown("#### 2️⃣ E1 입력창 복붙용 클립보드 (위 테이블과 100% 동일한 데이터)")
+    df_e1 = pd.DataFrame()
+    df_e1['Line Number'] = [''] * len(df_target)
+    df_e1['Item  Number'] = df_target['제품코드']
+    df_e1['Description'] = [''] * len(df_target)
+    df_e1['Quantity Ordered'] = df_target['수량'].astype(int)
+    df_e1['Unit Price'] = df_target['단가']
+    df_e1['Extended Price'] = (df_target['수량'] * df_target['단가']).astype(int)
+    df_e1['Last Status'] = [''] * len(df_target)
+    df_e1['Lot Number'] = df_target['LOT']
+    df_e1['Requested Date'] = [''] * len(df_target)
+    df_e1['Location'] = df_target['Location']
+
+    gb2 = GridOptionsBuilder.from_dataframe(df_e1)
+    gb2.configure_default_column(filterable=True, sortable=True, resizable=True, filter='agTextColumnFilter')
+    gb2.configure_column("Quantity Ordered", filter='agNumberColumnFilter')
+    gb2.configure_column("Unit Price", filter='agNumberColumnFilter')
+    gb2.configure_column("Extended Price", filter='agNumberColumnFilter')
+    gb2.configure_selection(selection_mode="multiple", use_checkbox=True)
+    gb2.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
+
+    AgGrid(
+        df_e1,
+        gridOptions=gb2.build(),
+        height=280,
+        theme='balham',
+        fit_columns_on_grid_load=False,
+        key=f"{key_prefix}_grid2"
+    )
+
+    # TSV 다운로드 지원
+    tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
+    st.download_button(
+        label=f"📥 [{key_prefix}] E1 복붙용 .tsv 다운로드",
+        data=tsv_data,
+        file_name=f"E1_Upload_{key_prefix}.tsv",
+        mime="text/tab-separated-values",
+        key=f"{key_prefix}_btn"
+    )
+
+
+# ---------------------------------------------------------
+# 4. 메인 데이터 처리 및 탭 구성
 # ---------------------------------------------------------
 if sales_file and onhand_file:
     df_result = process_data(sales_file, sales_file.name, onhand_file, onhand_file.name)
@@ -198,92 +263,28 @@ if sales_file and onhand_file:
         st.error("처리 가능한 데이터가 없습니다.")
         st.stop()
 
-    # ---------------------------------------------------------
-    # 1st GRID: 세일즈 리포트 확인 그리드
-    # ---------------------------------------------------------
     st.markdown("---")
-    st.subheader("1️⃣ 세일즈 리포트 확인 그리드 (초고속 AgGrid)")
-    st.caption("💡 각 열 헤더의 **필터 아이콘**으로 엑셀처럼 필터링하고, **셀/범위를 드래그**하면 우측 하단에 **합계/평균이 자동 계산**됩니다.")
-
-    sales_report_cols = [
-        '구분', 'Date', 'Customer', 'bill to', 'Ship to', 
-        '제품코드', '제품명', '수량', '단가', 'Total Amount', '매입확인', 'LOT', '상태메시지'
-    ]
-    df_sales_disp = df_result[sales_report_cols].copy()
-
-    # 🚀 문자열/숫자 전체 필터 활성화 옵션
-    gb1 = GridOptionsBuilder.from_dataframe(df_sales_disp)
-    gb1.configure_default_column(
-        filterable=True, 
-        sortable=True, 
-        resizable=True,
-        filter='agTextColumnFilter'  # 기본 필터를 텍스트 검색 필터로 지정
-    )
-    gb1.configure_column("수량", filter='agNumberColumnFilter')
-    gb1.configure_column("단가", filter='agNumberColumnFilter')
-    gb1.configure_column("Total Amount", filter='agNumberColumnFilter')
     
-    gb1.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb1.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
+    # Customer 별 Unique 목록 생성 (빈 값 제외)
+    customers = sorted([c for c in df_result['Customer'].unique() if pd.notna(c) and str(c).strip() != ''])
     
-    gridOptions1 = gb1.build()
+    # 탭 생성 (전체 + Customer별 탭)
+    tab_names = ["📊 전체 모아보기"] + [f"🏢 {cust}" for cust in customers]
+    tabs = st.tabs(tab_names)
 
-    AgGrid(
-        df_sales_disp,
-        gridOptions=gridOptions1,
-        height=350,
-        theme='balham',
-        fit_columns_on_grid_load=False
-    )
+    # 1. 전체 모아보기 탭
+    with tabs[0]:
+        st.info(f"💡 전체 **{len(df_result):,}건** 데이터입니다.")
+        render_aggrid_pair(df_result, key_prefix="전체")
 
-    # ---------------------------------------------------------
-    # 2nd GRID: E1 입력창 복붙용 클립보드 그리드
-    # ---------------------------------------------------------
-    st.markdown("---")
-    st.subheader("2️⃣ E1 입력창 복붙용 클립보드 그리드")
-    st.caption("📋 원하는 행을 드래그하여 선택 후 `Ctrl+C` 하여 E1에 붙여넣으세요.")
-
-    df_e1 = pd.DataFrame()
-    df_e1['Line Number'] = [''] * len(df_result)
-    df_e1['Item  Number'] = df_result['제품코드']
-    df_e1['Description'] = [''] * len(df_result)
-    df_e1['Quantity Ordered'] = df_result['수량'].astype(int)
-    df_e1['Unit Price'] = df_result['단가']
-    df_e1['Extended Price'] = (df_result['수량'] * df_result['단가']).astype(int)
-    df_e1['Last Status'] = [''] * len(df_result)
-    df_e1['Lot Number'] = df_result['LOT']
-    df_e1['Requested Date'] = [''] * len(df_result)
-    df_e1['Location'] = df_result['Location']
-
-    gb2 = GridOptionsBuilder.from_dataframe(df_e1)
-    gb2.configure_default_column(
-        filterable=True, 
-        sortable=True, 
-        resizable=True,
-        filter='agTextColumnFilter'
-    )
-    gb2.configure_column("Quantity Ordered", filter='agNumberColumnFilter')
-    gb2.configure_column("Unit Price", filter='agNumberColumnFilter')
-    gb2.configure_column("Extended Price", filter='agNumberColumnFilter')
-
-    gb2.configure_selection(selection_mode="multiple", use_checkbox=True)
-    gb2.configure_grid_options(enableRangeSelection=True, enableStatusBar=True)
-    
-    gridOptions2 = gb2.build()
-
-    AgGrid(
-        df_e1,
-        gridOptions=gridOptions2,
-        height=350,
-        theme='balham',
-        fit_columns_on_grid_load=False
-    )
-
-    # 📥 TSV 보조 다운로드
-    tsv_data = df_e1.to_csv(sep='\t', index=False, header=False).encode('utf-8-sig')
-    st.download_button(
-        label="📥 E1 복붙용 데이터 파일 다운로드 (.tsv)",
-        data=tsv_data,
-        file_name="E1_Upload_Data.tsv",
-        mime="text/tab-separated-values"
-    )
+    # 2. 거래처별 탭
+    for idx, cust in enumerate(customers):
+        with tabs[idx + 1]:
+            df_cust = df_result[df_result['Customer'] == cust].copy()
+            
+            tot_qty = df_cust['수량'].sum()
+            tot_amt = df_cust['Total Amount'].sum()
+            st.success(f"📌 **{cust}** | 총 **{len(df_cust):,}건** | 수량: `{tot_qty:,}개` | 금액: `{tot_amt:,}원`")
+            
+            # 각 거래처 탭 내에서 두 그리드가 100% 동일한 데이터로 자동 연동됨
+            render_aggrid_pair(df_cust, key_prefix=str(cust))
