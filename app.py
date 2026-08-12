@@ -1,153 +1,218 @@
 import streamlit as st
 import pandas as pd
 import io
-import re
-from datetime import datetime
 
-st.set_page_config(page_title="롯데마트 수주 자동화", page_icon="🔴", layout="wide")
+st.set_page_config(page_title="E1 수주/출고 자동 매칭 시스템", layout="wide")
 
-# 💡 센터별 고정 발주/배송코드 매핑
-CENTER_CODE_MAP = {
-    '오산센터': '81030907',
-    '김해센터': '81030908'
-}
+st.title("📦 E1(JD Edwards) 실재고 연동 Auto-LOT 매칭 도구")
+st.caption("세일즈 리포트와 E1 재고 리포트(RST4101)를 기반으로 재고 부족 에러 없는 E1 입력 데이터를 생성합니다.")
 
-# 💡 센터명 정제 함수
-def clean_center_name(name):
-    name = str(name).strip()
-    # '상온센타', '상온센터', '센타'를 모두 '센터'로 통일
-    name = re.sub(r'상온센타|상온센터|센타', '센터', name)
-    # 중복 정제 처리 (예: 센터센터 -> 센터)
-    return name.replace('센터센터', '센터')
+# ---------------------------------------------------------
+# 1. 파일 업로드 영역
+# ---------------------------------------------------------
+col_up1, col_up2 = st.columns(2)
 
-@st.cache_data
-def load_lotte_master(path):
+with col_up1:
+    sales_file = st.file_uploader("1. 세일즈 리포트 업로드 (.xlsx)", type=["xlsx", "xls", "csv"], key="sales")
+
+with col_up2:
+    onhand_file = st.file_uploader("2. E1 재고 리포트(RST4101) 업로드 (.csv, .xlsx)", type=["csv", "xlsx", "xls"], key="onhand")
+
+# ---------------------------------------------------------
+# 2. 데이터 처리 및 Auto-LOT 매칭 로직
+# ---------------------------------------------------------
+if sales_file and onhand_file:
+    # A. 세일즈 리포트 읽기
     try:
-        df_prod = pd.read_excel(path, sheet_name='롯데마트 제품코드', dtype=str)
-        df_prod.columns = [str(c).strip() for c in df_prod.columns]
-        barcode_col = df_prod.columns[0]
-        me_col = df_prod.columns[2]
-        
-        prod_map = {}
-        for _, r in df_prod.iterrows():
-            if pd.notna(r[barcode_col]):
-                b_code = str(r[barcode_col]).strip().split('.')[0]
-                prod_map[b_code] = str(r[me_col]).strip()
-        return prod_map, None
+        if sales_file.name.endswith(('.xlsx', '.xls')):
+            df_sales = pd.read_excel(sales_file, sheet_name='일일출고')
+        else:
+            df_sales = pd.read_csv(sales_file)
     except Exception as e:
-        return {}, str(e)
+        st.error(f"세일즈 리포트를 읽는 중 오류가 발생했습니다: {e}")
+        st.stop()
 
-st.title("🛒🔴 롯데마트 수주 자동화")
+    # B. E1 재고 리포트(RST4101) 읽기
+    try:
+        if onhand_file.name.endswith('.csv'):
+            # RST4101 헤더 위치 처리 (보통 2번째 행이 헤더: Branch, Item Number 등)
+            df_onhand_raw = pd.read_csv(onhand_file, encoding='utf-8', header=1)
+            if 'Location' not in df_onhand_raw.columns:
+                onhand_file.seek(0)
+                df_onhand_raw = pd.read_csv(onhand_file, encoding='euc-kr', header=1)
+        else:
+            df_onhand_raw = pd.read_excel(onhand_file, header=1)
+    except Exception as e:
+        st.error(f"E1 재고 리포트(RST4101)를 읽는 중 오류가 발생했습니다: {e}")
+        st.stop()
 
-MASTER_FILE = "롯데마트_서식파일_업데이트용.xlsx"
-prod_dict, error = load_lotte_master(MASTER_FILE)
-
-if error:
-    st.error(f"마스터 파일 로드 실패: {error}")
-else:
-    st.markdown("### ※ 업로드 전 확인사항")
-    st.info("💡 **엑셀파일 확장자를 .xlsx로 변환 후 업로드해주세요.**")
+    # C. E1 재고 전처리 (Location == 'PRI' & On-Hand Qty > 0)
+    # 컬럼명 정리 및 데이터 타입 변환
+    df_onhand_raw.columns = df_onhand_raw.columns.str.strip()
     
-    uploaded_file = st.file_uploader("가공된 롯데마트 로우 데이터를 업로드하세요.", type=['xlsx'])
+    # 필수 컬럼 존재 확인
+    req_cols = ['Item Number', 'Location', 'Lot Number', 'Lot Expiration Date', 'On-Hand Qty']
+    if not all(col in df_onhand_raw.columns for col in req_cols):
+        st.error(f"재고 리포트에 필수 컬럼이 누락되었습니다. 필요한 컬럼: {req_cols}")
+        st.stop()
 
-    if uploaded_file:
-        try:
-            # 전체 데이터를 헤더 없이 로드 (위치 파악용)
-            df_full = pd.read_excel(uploaded_file, header=None)
+    df_pri = df_onhand_raw[
+        (df_onhand_raw['Location'] == 'PRI') & 
+        (pd.to_numeric(df_onhand_raw['On-Hand Qty'], errors='coerce') > 0)
+    ].copy()
+
+    df_pri['On-Hand Qty'] = pd.to_numeric(df_pri['On-Hand Qty'])
+    df_pri['Item Number'] = df_pri['Item Number'].astype(str).str.strip()
+    df_pri['Lot Number'] = df_pri['Lot Number'].astype(str).str.strip()
+    # 유통기한 정렬용 변환
+    df_pri['Lot Expiration Date'] = pd.to_datetime(df_pri['Lot Expiration Date'], errors='coerce')
+
+    # D. 세일즈 데이터 필터링 (수량 > 0)
+    df_sales['수량'] = pd.to_numeric(df_sales['수량'], errors='coerce').fillna(0)
+    df_sales_valid = df_sales[df_sales['수량'] > 0].copy()
+
+    # ---------------------------------------------------------
+    # 3. Smart LOT Matching Engine
+    # ---------------------------------------------------------
+    # 가상 가용재고 수량 추적용 딕셔너리 생성: (Item Number, Lot Number) -> Qty
+    inventory_pool = {}
+    for _, row in df_pri.iterrows():
+        key = (row['Item Number'], row['Lot Number'])
+        inventory_pool[key] = inventory_pool.get(key, 0) + row['On-Hand Qty']
+
+    matched_rows = []
+    shortage_alerts = []
+
+    for idx, s_row in df_sales_valid.iterrows():
+        # 제품코드 매핑 (세일즈의 제품코드 vs E1 재고의 Item Number)
+        item_code = str(s_row['제품코드']).strip()
+        # E1 재고의 Item Number는 앞에 'K'가 붙는 경우에 대한 처리
+        if not df_pri[df_pri['Item Number'] == item_code].empty:
+            e1_item_code = item_code
+        elif not df_pri[df_pri['Item Number'] == 'K' + item_code].empty:
+            e1_item_code = 'K' + item_code
+        else:
+            e1_item_code = item_code
+
+        req_qty = float(s_row['수량'])
+        unit_price = float(s_row.get('단가', 0))
+        sales_lot = str(s_row.get('LOT', '')).strip() if pd.notna(s_row.get('LOT')) else ''
+
+        # 해당 제품의 PRI 가용 LOT 목록 구하기 (유통기한 임박 순 정렬 - FEFO)
+        item_inventory = df_pri[df_pri['Item Number'] == e1_item_code].sort_values(by='Lot Expiration Date')
+
+        allocated_qty = 0
+
+        # 1차 시도: 세일즈 리포트에 적힌 LOT에 재고가 있는지 확인
+        if sales_lot and (e1_item_code, sales_lot) in inventory_pool and inventory_pool[(e1_item_code, sales_lot)] > 0:
+            avail = inventory_pool[(e1_item_code, sales_lot)]
+            use_qty = min(req_qty, avail)
             
-            # 1. 납품일자 추출 (H6 셀 -> 인덱스 5행, 7열)
-            try:
-                raw_delivery_date = str(df_full.iloc[5, 7]) 
-                delivery_date = "".join(re.findall(r'\d+', raw_delivery_date))[:8]
-            except:
-                delivery_date = ""
-
-            # 2. 센터정보 추출 (F6 셀 -> 인덱스 5행, 5열)
-            # 파일 구조상 6행의 '점포(센터)' 열에 해당하는 위치에서 센터명을 가져옵니다.
-            try:
-                raw_center = str(df_full.iloc[5, 5]).strip()
-                cleaned_center = clean_center_name(raw_center)
-                s_code = CENTER_CODE_MAP.get(cleaned_center)
-            except:
-                raw_center = ""
-                s_code = None
-
-            # 3. 데이터 본문 시작점 찾기 (헤더 '상품코드' 위치)
-            header_row_idx = 0
-            for i, row in df_full.iterrows():
-                if '상품코드' in [str(v).strip() for v in row.values]:
-                    header_row_idx = i
-                    break
+            matched_rows.append({
+                'Item Number': item_code,
+                'Quantity Ordered': use_qty,
+                'Unit Price': unit_price,
+                'Extended Price': use_qty * unit_price,
+                'Last Status': '',
+                'Lot Number': sales_lot,
+                'Requested Date': s_row.get('Date', ''),
+                'Location': 'PRI',
+                'Branch/Plant': 'KW',
+                'Sold To': s_row.get('bill to ', s_row.get('Ship to ', '')),
+                'Ship To': s_row.get('Ship to ', ''),
+                'Customer': s_row.get('Customer', ''),
+                '매칭상태': '세일즈 LOT 일치'
+            })
             
-            # 실제 데이터 로드
-            df_raw = pd.read_excel(uploaded_file, header=header_row_idx)
-            df_raw.columns = [str(c).strip() for c in df_raw.columns]
+            inventory_pool[(e1_item_code, sales_lot)] -= use_qty
+            req_qty -= use_qty
 
-            if not s_code:
-                st.error(f"❌ 센터 정보를 찾을 수 없습니다. (추출된 값: {raw_center})")
-                st.stop()
+        # 2차 시도: 잔여 수량이 있거나 세일즈 LOT가 없을 경우 FEFO 기준으로 자동 대체/분할
+        if req_qty > 0:
+            for _, inv_row in item_inventory.iterrows():
+                cur_lot = inv_row['Lot Number']
+                avail = inventory_pool.get((e1_item_code, cur_lot), 0)
 
-            temp_rows = []
-            for _, row in df_raw.iterrows():
-                # '합계' 행 등 불필요한 행 제외
-                if pd.isna(row.get('상품코드')) or '합계' in str(row.get('상품코드')):
+                if avail <= 0:
                     continue
 
-                # 수량 계산
-                raw_order = str(row.get('주문수', '0'))
-                order_num = "".join(re.findall(r'\d+', raw_order))
-                order_qty = int(order_num) if order_num else 0
+                use_qty = min(req_qty, avail)
                 
-                try:
-                    ipsu = int(float(str(row.get('입수', 1)).replace(',', '')))
-                except:
-                    ipsu = 1
-                
-                try:
-                    unit_price = int(float(str(row.get('단가', '0')).replace(',', '')))
-                except:
-                    unit_price = 0
-                
-                unit_qty = order_qty * ipsu
-                
-                # 바코드 소수점 제거 후 ME코드 매칭
-                sell_code = str(row.get('판매코드', '')).strip().split('.')[0]
-                me_code = prod_dict.get(sell_code, f"미등록({sell_code})")
-                
-                if unit_qty > 0:
-                    temp_rows.append({
-                        '출고구분': 0,
-                        '수주일자': datetime.now().strftime('%Y%m%d'),
-                        '납품일자': delivery_date,
-                        '발주처코드': '81030907',
-                        '발주처': '롯데마트',
-                        '배송코드': s_code,
-                        '배송지': raw_center,
-                        '상품코드': me_code,
-                        '상품명': str(row.get('상품명', '')),
-                        'UNIT수량': unit_qty,
-                        'UNIT단가': unit_price
-                    })
+                matched_rows.append({
+                    'Item Number': item_code,
+                    'Quantity Ordered': use_qty,
+                    'Unit Price': unit_price,
+                    'Extended Price': use_qty * unit_price,
+                    'Last Status': '',
+                    'Lot Number': cur_lot,
+                    'Requested Date': s_row.get('Date', ''),
+                    'Location': 'PRI',
+                    'Branch/Plant': 'KW',
+                    'Sold To': s_row.get('bill to ', s_row.get('Ship to ', '')),
+                    'Ship To': s_row.get('Ship to ', ''),
+                    'Customer': s_row.get('Customer', ''),
+                    '매칭상태': 'E1 FEFO 자동대체' if sales_lot != cur_lot else '세일즈 LOT 분할매칭'
+                })
 
-            if temp_rows:
-                df_temp = pd.DataFrame(temp_rows)
-                grp_cols = ['출고구분', '수주일자', '납품일자', '발주처코드', '발주처', '배송코드', '배송지', '상품코드', '상품명', 'UNIT단가']
-                df_final = df_temp.groupby(grp_cols, as_index=False)['UNIT수량'].sum()
-                
-                df_final['금        액'] = df_final['UNIT수량'] * df_final['UNIT단가']
-                df_final['부  가   세'] = (df_final['금        액'] * 0.1).astype(int)
+                inventory_pool[(e1_item_code, cur_lot)] -= use_qty
+                req_qty -= use_qty
 
-                final_cols = ['출고구분', '수주일자', '납품일자', '발주처코드', '발주처', '배송코드', '배송지', '상품코드', '상품명', 'UNIT수량', 'UNIT단가', '금        액', '부  가   세']
-                df_final = df_final.reindex(columns=final_cols)
+                if req_qty <= 0:
+                    break
 
-                st.success(f"✅ 분석 완료! (센터: {raw_center}, 납품일: {delivery_date})")
-                st.dataframe(df_final, use_container_width=True)
+        # 3차: 전체 PRI 재고 부족 시 경고 기록
+        if req_qty > 0:
+            shortage_alerts.append({
+                '제품코드': item_code,
+                '제품명': s_row.get('제품명', ''),
+                '부족수량': req_qty,
+                '고객사': s_row.get('Customer', '')
+            })
 
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df_final.to_excel(writer, index=False, sheet_name='서식업로드')
-                st.download_button(label="📥 결과 다운로드", data=output.getvalue(), file_name=f"Lotte_Result_{datetime.now().strftime('%m%d')}.xlsx")
-            else:
-                st.warning("처리할 데이터가 없습니다.")
-        except Exception as e:
-            st.error(f"실행 오류: {str(e)}")
+    df_result = pd.DataFrame(matched_rows)
+
+    # ---------------------------------------------------------
+    # 4. 결과 출력 및 인터페이스
+    # ---------------------------------------------------------
+    if shortage_alerts:
+        st.error("⚠️ [재고 부족 경고] 아래 품목은 E1 PRI 로케이션 재고가 부족하여 일부/전량 매칭되지 못했습니다!")
+        st.dataframe(pd.DataFrame(shortage_alerts))
+
+    st.markdown("---")
+    st.subheader("📋 1. E1 입력 데이터 필터링 (거래처 / 날짜별)")
+
+    # 거래처 및 날짜 필터
+    customers = ['전체'] + list(df_result['Customer'].dropna().unique())
+    selected_customer = st.selectbox("거래처(Customer) 선택:", customers)
+
+    df_filtered = df_result if selected_customer == '전체' else df_result[df_result['Customer'] == selected_customer]
+
+    # Header 정보 노출
+    if not df_filtered.empty:
+        col_h1, col_h2, col_h3 = st.columns(3)
+        with col_h1:
+            st.info(f"**Sold To:** `{df_filtered['Sold To'].iloc[0]}`")
+        with col_h2:
+            st.info(f"**Ship To:** `{df_filtered['Ship To'].iloc[0]}`")
+        with col_h3:
+            st.info("**Branch/Plant:** `KW`")
+
+    st.subheader("📋 2. E1 Detail 그리드 매칭 결과")
+    
+    # E1 Grid 입력 컬럼 순서
+    e1_grid_cols = ['Item Number', 'Quantity Ordered', 'Unit Price', 'Extended Price', 'Last Status', 'Lot Number', 'Location', 'Branch/Plant', '매칭상태']
+    st.dataframe(df_filtered[e1_grid_cols], use_container_width=True)
+
+    # E1 붙여넣기용 TSV 생성
+    tsv_cols = ['Item Number', 'Quantity Ordered', 'Unit Price', 'Extended Price', 'Last Status', 'Lot Number', 'Requested Date', 'Location', 'Branch/Plant']
+    
+    # 날짜 포맷 정리 (YYYY/MM/DD)
+    df_tsv = df_filtered[tsv_cols].copy()
+    df_tsv['Requested Date'] = pd.to_datetime(df_tsv['Requested Date'], errors='coerce').dt.strftime('%Y/%m/%d').fillna('')
+
+    tsv_data = df_tsv.to_csv(sep='\t', index=False, header=False)
+
+    st.subheader("📋 3. E1 붙여넣기용 클립보드 데이터 (TSV)")
+    st.write("👉 아래 텍스트 박스를 **클릭** 후 `Ctrl+A` ➡️ `Ctrl+C` 하시고, E1 Detail 그리드의 `Item Number` 첫 칸에서 `Ctrl+V` 하세요.")
+    
+    st.text_area("E1 복붙용 데이터 (Tab 구분)", value=tsv_data, height=200)
