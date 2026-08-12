@@ -4,7 +4,7 @@ import numpy as np
 
 st.set_page_config(page_title="E1 수주/출고 자동 입력 헬퍼", layout="wide")
 
-st.title("📦 E1(JD Edwards) 입력 자동화 & 재고 거름망 시스템")
+st.title("📦 E1 Auto Grid (E1 오토 그리드)")
 st.caption("세일즈 리포트의 매출/반품 건을 확인하고, Inventory On-Hand Report와 매칭하여 E1에 즉시 복붙 가능한 클립보드를 생성합니다.")
 
 # ---------------------------------------------------------
