@@ -2,4 +2,4 @@ streamlit
 pandas
 openpyxl
 xlsxwriter
-pip install streamlit-aggrid
+streamlit-aggrid
